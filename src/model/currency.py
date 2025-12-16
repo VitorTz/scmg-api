@@ -15,7 +15,7 @@ async def get_last_currency_data(conn: Connection) -> Optional[Currency]:
                 uyu,
                 created_at
             FROM
-                currency_values
+                currencies
             ORDER BY
                 created_at DESC
             LIMIT 1
@@ -28,7 +28,7 @@ async def get_last_currency_data(conn: Connection) -> Optional[Currency]:
 async def create_currency_data(currency: Currency, conn: Connection) -> Currency:
     row = await conn.fetchrow(
         """
-            INSERT INTO currency_values (
+            INSERT INTO currencies (
                 usd,
                 ars,
                 eur,

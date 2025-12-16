@@ -1,4 +1,10 @@
 -- ============================================================================
+-- SCMG - RLS COMPLETO (V2.1)
+-- Sistema de gestão para pequeno comércio com bar, lanchonete e mercearia
+-- ============================================================================
+
+
+-- ============================================================================
 -- FUNCTIONS
 -- ============================================================================
 
@@ -8,11 +14,20 @@ DECLARE
     _uid text;
 BEGIN
     _uid := current_setting('app.current_user_id', true);
-    IF _uid IS NULL OR _uid = '' THEN RETURN NULL; END IF;
+    
+    IF _uid IS NULL OR _uid = '' OR NOT _uid ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN 
+        RETURN NULL; 
+    END IF;
+    
     RETURN _uid::UUID;
-EXCEPTION WHEN OTHERS THEN RETURN NULL;
+EXCEPTION 
+    WHEN invalid_text_representation THEN 
+        RAISE WARNING 'Tentativa de UUID inválido: %', _uid;
+        RETURN NULL;
+    WHEN OTHERS THEN 
+        RETURN NULL;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+$$ LANGUAGE plpgsql SECURITY DEFINER STABLE;
 
 
 -- Obtém o tenant_id do usuário
@@ -114,11 +129,7 @@ DECLARE
     session_user_id UUID;
     is_staff BOOLEAN;
 BEGIN
-    -- 0. SUPERUSER BYPASS
-    IF current_user = 'postgres' THEN
-        RETURN NEW;
-    END IF;    
-
+    
     -- 1. RECUPERA VARIÁVEIS DE SESSÃO
     -- Usamos NULLIF para garantir que strings vazias virem NULL antes do cast
     BEGIN
@@ -142,15 +153,33 @@ BEGIN
          RAISE EXCEPTION 'ACESSO NEGADO: Usuário anônimo não pode realizar esta operação.';
     END IF;
 
-    -- Usa o schema explicitamente para segurança
-    IF NOT public.is_staff_user(session_user_id) THEN
-        RAISE EXCEPTION 'PERMISSÃO INSUFICIENTE: Apenas Staff (Admin, Gerente, Caixa) pode realizar esta operação.';
-    END IF;
-
     -- Auditoria    
     NEW.tenant_id := session_tenant_id;
     NEW.created_by := session_user_id;
 
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+
+CREATE OR REPLACE FUNCTION fn_force_tenant_id()
+RETURNS TRIGGER AS $$
+DECLARE
+    _session_tenant_id text;
+BEGIN
+    -- 1. Tenta obter o tenant_id da sessão atual (configurado pelo Python)
+    _session_tenant_id := current_setting('app.current_tenant_id', true);
+
+    -- 2. Se existir uma sessão RLS ativa (não é nula e não é vazia)
+    IF _session_tenant_id IS NOT NULL AND _session_tenant_id <> '' THEN
+        -- FORÇA o tenant_id do novo registro para ser o da sessão
+        -- Isso garante segurança mesmo que a query SQL tente passar outro ID
+        NEW.tenant_id := _session_tenant_id::UUID;
+    END IF;
+
+    -- 3. Se não houver sessão (ex: rodando migrations ou seeds como superuser),
+    -- ele aceita o tenant_id que vier na query INSERT (ou falha se for NULL).
+    
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -201,12 +230,8 @@ DECLARE
     creator_rank INTEGER;
     new_role_rank INTEGER;
 BEGIN
-    -- 1. Bypass para Superusuário (postgres) e manutenção
-    IF current_user = 'postgres' OR current_role = 'postgres' THEN
-        RETURN NEW;
-    END IF;
-
-    -- 2. Recupera quem está tentando criar o papel
+    
+    -- 1. Recupera quem está tentando criar o papel
     BEGIN
         session_user_id := current_setting('app.current_user_id', true)::UUID;
     EXCEPTION WHEN OTHERS THEN
@@ -217,13 +242,13 @@ BEGIN
         RAISE EXCEPTION 'SEGURANÇA: Tentativa de atribuir permissões sem usuário identificado.';
     END IF;
 
-    -- 3. Obtém o Rank do Criador (quem está logado)
+    -- 2. Obtém o Rank do Criador (quem está logado)
     creator_rank := get_user_highest_rank(session_user_id);
 
-    -- 4. Obtém o Rank do Papel que está sendo dado
+    -- 3. Obtém o Rank do Papel que está sendo dado
     new_role_rank := get_role_rank(NEW.role);
 
-    -- 5. Comparação de Segurança
+    -- 4. Comparação de Segurança
     IF new_role_rank > creator_rank THEN
         RAISE EXCEPTION 'ACESSO NEGADO: Escalação de Privilégio detectada. Seu nível de autoridade (%) não permite atribuir o papel % (Nível %).', 
             creator_rank, NEW.role, new_role_rank;
@@ -386,6 +411,12 @@ CREATE POLICY categories_delete_policy ON categories
         AND has_any_role('ADMIN')
     );
 
+-- Trigger para garantir tenant na inserção
+CREATE OR REPLACE TRIGGER trg_categories_enforce_tenant
+BEFORE INSERT ON categories
+FOR EACH ROW
+EXECUTE FUNCTION fn_enforce_tenant_isolation();
+
 
 -- ============================================================================
 -- SUPPLIERS - Isolamento por Tenant
@@ -422,6 +453,12 @@ CREATE POLICY suppliers_delete_policy ON suppliers
         AND has_any_role('ADMIN')
     );
 
+-- Trigger para garantir tenant na inserção
+CREATE OR REPLACE TRIGGER trg_suppliers_enforce_tenant
+BEFORE INSERT ON suppliers
+FOR EACH ROW
+EXECUTE FUNCTION fn_enforce_tenant_isolation();
+
 -- ============================================================================
 -- TAX_GROUPS - Isolamento por Tenant
 -- ============================================================================
@@ -445,6 +482,12 @@ CREATE POLICY tax_groups_modify_policy ON tax_groups
         AND has_any_role('ADMIN', 'CONTADOR')
     );
 
+
+-- Trigger para garantir tenant na inserção
+CREATE OR REPLACE TRIGGER trg_tax_groups_enforce_tenant
+BEFORE INSERT ON tax_groups
+FOR EACH ROW
+EXECUTE FUNCTION fn_enforce_tenant_isolation();
 
 -- ============================================================================
 -- RECIPES - Acesso via produto pai
@@ -500,8 +543,15 @@ CREATE POLICY batches_modify_policy ON batches
     );
 
 
+-- Trigger para garantir tenant na inserção
+CREATE OR REPLACE TRIGGER trg_batches_enforce_tenant
+BEFORE INSERT ON batches
+FOR EACH ROW
+EXECUTE FUNCTION fn_enforce_tenant_isolation();
+
+
 -- ============================================================================
--- 7. USER_ADDRESSES - Privacidade de Endereços
+-- USER_ADDRESSES - Privacidade de Endereços
 -- ============================================================================
 
 ALTER TABLE user_addresses ENABLE ROW LEVEL SECURITY;
@@ -539,6 +589,12 @@ CREATE POLICY user_addresses_modify_policy ON user_addresses
         AND has_any_role('ADMIN', 'GERENTE', 'CAIXA')
     );
 
+-- Trigger para garantir tenant na inserção
+CREATE OR REPLACE TRIGGER trg_user_addresses_enforce_tenant
+BEFORE INSERT ON user_addresses
+FOR EACH ROW
+EXECUTE FUNCTION fn_enforce_tenant_isolation();
+
 
 -- ============================================================================
 -- USER_ROLES - Controle Crítico de Permissões
@@ -546,49 +602,45 @@ CREATE POLICY user_addresses_modify_policy ON user_addresses
 
 ALTER TABLE user_roles ENABLE ROW LEVEL SECURITY;
 
--- Leitura: Apenas para usuários do mesmo tenant
+-- READ [ALL WITH SAME tenant_id]
 DROP POLICY IF EXISTS user_roles_select_policy ON user_roles;
 CREATE POLICY user_roles_select_policy ON user_roles
     FOR SELECT
     USING (
-        EXISTS (
-            SELECT 
-                1 
-            FROM users 
-            WHERE 
-                users.id = user_roles.id
-                AND users.tenant_id = auth_tenant_id()
-        )
+        tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
     );
 
--- Inserção/Atualização: Apenas ADMIN (já tem trigger de escalation)
+-- INSERTION [ADMIN, GERENTE e CAIXA]
 DROP POLICY IF EXISTS user_roles_modify_policy ON user_roles;
 CREATE POLICY user_roles_modify_policy ON user_roles
-    FOR ALL
-    USING (
-        EXISTS (
-            SELECT 
-                1 
-            FROM 
-                users 
-            WHERE 
-                users.id = user_roles.id 
-                AND users.tenant_id = auth_tenant_id()
-        )
-        AND has_any_role('ADMIN', 'GERENTE', 'CAIXA')
-    )
+    FOR INSERT
     WITH CHECK (
-        EXISTS (
-            SELECT 
-                1 
-            FROM users 
-            WHERE 
-                users.id = user_roles.id
-                AND users.tenant_id = auth_tenant_id()
-        )
-        AND has_any_role('ADMIN', 'GERENTE', 'CAIXA')
+        tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
+        AND has_any_role('ADMIN', 'CAIXA', 'GERENTE')        
     );
 
+-- DELETE [ADMIN e GERENTE]
+DROP POLICY IF EXISTS user_roles_delete_policy ON user_roles;
+CREATE POLICY user_roles_delete_policy ON user_roles
+    FOR DELETE
+    USING (
+        tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
+        AND has_any_role('ADMIN', 'GERENTE')
+    );
+
+-- [NÃO PERMITE MUDAR O tenant_id DA TABELA user_roles]
+DROP TRIGGER IF EXISTS trg_prevent_tenant_change_user_roles ON user_roles;
+CREATE TRIGGER trg_prevent_tenant_change_user_roles
+BEFORE UPDATE ON user_roles
+FOR EACH ROW
+EXECUTE FUNCTION fn_prevent_tenant_change();
+
+-- [FORÇA O tenant_id A SER O MESMO DE QUEM ESTÁ CRIANDO]
+DROP TRIGGER IF EXISTS trg_force_tenant_user_roles ON user_roles;
+CREATE TRIGGER trg_force_tenant_user_roles
+BEFORE INSERT ON user_roles
+FOR EACH ROW
+EXECUTE FUNCTION fn_force_tenant_id();
 
 -- ============================================================================
 -- PRICE_AUDITS - Auditoria de Preços
@@ -656,6 +708,11 @@ CREATE POLICY stock_movements_delete_policy ON stock_movements
         AND has_any_role('ADMIN')
     );
 
+-- Trigger para garantir tenant na inserção
+CREATE OR REPLACE TRIGGER trg_stock_movements_enforce_tenant
+BEFORE INSERT ON stock_movements
+FOR EACH ROW
+EXECUTE FUNCTION fn_enforce_tenant_isolation();
 
 -- ============================================================================
 -- SALES - Vendas (CRÍTICO)
@@ -821,8 +878,8 @@ ALTER TABLE user_feedbacks ENABLE ROW LEVEL SECURITY;
 -- Qualquer usuário autenticado pode enviar feedback
 DROP POLICY IF EXISTS feedbacks_insert_policy ON user_feedbacks;
 CREATE POLICY feedbacks_insert_policy ON user_feedbacks
-    FOR INSERT
-    WITH CHECK (true);
+FOR INSERT
+WITH CHECK (true);
 
 
 -- ============================================================================
@@ -830,7 +887,7 @@ CREATE POLICY feedbacks_insert_policy ON user_feedbacks
 -- ============================================================================
 ALTER TABLE users ENABLE ROW LEVEL SECURITY;
 
--- Policy de Leitura: Usuário vê apenas usuários do mesmo Tenant
+-- [USUÁRIO VÊ APENAS OUTROS USUÁRIOS DO MESMO TENANT]
 DROP POLICY IF EXISTS users_isolation_policy ON users;
 CREATE POLICY users_isolation_policy ON users
     FOR SELECT
@@ -838,6 +895,7 @@ CREATE POLICY users_isolation_policy ON users
         tenant_id = current_setting('app.current_tenant_id', true)::UUID
     );
 
+-- [USUÁRIOS PODEM INSERIR]
 DROP POLICY IF EXISTS users_insert_policy ON users;
 CREATE POLICY users_insert_policy ON users
     FOR INSERT
@@ -849,7 +907,7 @@ CREATE POLICY users_update_policy ON users
     FOR INSERT
     WITH CHECK (true); -- Trigger irá impedir de mudar tenant_id
 
--- Usuários podem atualizar a si mesmos (dados básicos)
+-- Usuários podem atualizar a si mesmos
 -- ADMIN, GERENTE E CAIXA pode atualizar outros usuários
 DROP POLICY IF EXISTS users_update_policy ON users;
 CREATE POLICY users_update_policy ON users
@@ -869,7 +927,7 @@ CREATE POLICY users_update_policy ON users
         )
     );
 
--- Deleção: Apenas ADMIN
+-- [APENAS ADMIN REMOVE]
 DROP POLICY IF EXISTS users_delete_policy ON users;
 CREATE POLICY users_delete_policy ON users
     FOR DELETE
@@ -885,59 +943,66 @@ FOR EACH ROW
 EXECUTE FUNCTION fn_enforce_tenant_isolation();
 
 
--- Aplicando o Trigger na tabela user_roles
+-- [IMPEDE UM USUÁRIO DE CRIAR UM ROLE COM MAIS PERMISSÕES QUE A SUA]
 DROP TRIGGER IF EXISTS trg_check_role_escalation ON user_roles;
-
 CREATE TRIGGER trg_check_role_escalation
 BEFORE INSERT OR UPDATE ON user_roles
 FOR EACH ROW
 EXECUTE FUNCTION fn_prevent_privilege_escalation();
 
 
+-- [FORÇA O tenant_id A SER O MESMO DE QUEM ESTÁ CRIANDO]
+DROP TRIGGER IF EXISTS trg_force_tenant_users ON users;
+CREATE TRIGGER trg_force_tenant_users
+BEFORE INSERT ON users
+FOR EACH ROW
+EXECUTE FUNCTION fn_force_tenant_id();
+
+
 -- ============================================================================
--- 2. CURRENCIES VALUES
+-- Currencies -- APENAS POSTGRES MANIPULA
 -- ============================================================================
 
-ALTER TABLE currency_values ENABLE ROW LEVEL SECURITY;
+ALTER TABLE currencies ENABLE ROW LEVEL SECURITY;
 
 -- Remove any existing policies
-DROP POLICY IF EXISTS currency_values_select ON currency_values;
-DROP POLICY IF EXISTS currency_values_write  ON currency_values;
-DROP POLICY IF EXISTS currency_values_update ON currency_values;
-DROP POLICY IF EXISTS currency_values_delete ON currency_values;
+DROP POLICY IF EXISTS currencies_select ON currencies;
+DROP POLICY IF EXISTS currencies_write  ON currencies;
+DROP POLICY IF EXISTS currencies_update ON currencies;
+DROP POLICY IF EXISTS currencies_delete ON currencies;
 
 -- 1. SELECT allowed to everyone
-CREATE POLICY currency_values_select
-ON currency_values
+CREATE POLICY currencies_select
+ON currencies
 FOR SELECT
 TO PUBLIC
 USING (true);
 
 -- 2. INSERT only allowed to postgres
-CREATE POLICY currency_values_write
-ON currency_values
+CREATE POLICY currencies_write
+ON currencies
 FOR INSERT
 TO postgres
 WITH CHECK (true);
 
 -- 3. UPDATE only allowed to postgres
-CREATE POLICY currency_values_update
-ON currency_values
+CREATE POLICY currencies_update
+ON currencies
 FOR UPDATE
 TO postgres
 USING (true)
 WITH CHECK (true);
 
 -- 4. DELETE only allowed to postgres
-CREATE POLICY currency_values_delete
-ON currency_values
+CREATE POLICY currencies_delete
+ON currencies
 FOR DELETE
 TO postgres
 USING (true);
 
 
 -- ============================================================================
--- CNPJS
+-- CNPJS -- APENAS POSTGRES MANIPULA
 -- ============================================================================
 
 ALTER TABLE cnpjs ENABLE ROW LEVEL SECURITY;
@@ -963,6 +1028,7 @@ ALTER TABLE addresses ENABLE ROW LEVEL SECURITY;
 
 DROP POLICY IF EXISTS policies_addresses_select ON addresses;
 
+-- [TODOS PODEM LER DE addresses]
 CREATE POLICY policies_addresses_select ON addresses
 FOR SELECT
 TO app_runtime
@@ -971,8 +1037,7 @@ USING (
 );
 
 
--- POLICY 2: CRIAÇÃO (INSERT)
--- Apenas usuários que passarem no teste is_staff_user podem inserir.
+-- [APENAS STAFF PODE INSERIR ENDEREÇOS]
 DROP POLICY IF EXISTS policies_addresses_insert ON addresses;
 CREATE POLICY policies_addresses_insert ON addresses
 FOR INSERT
@@ -981,8 +1046,7 @@ WITH CHECK (
     is_staff_user(current_setting('app.current_user_id', true)::UUID)
 );
 
--- POLICY 3: ATUALIZAÇÃO (UPDATE)
--- Geralmente queremos que Staff também possa corrigir endereços errados.
+-- [STAFF PODE ATUALIZAR ENDEREÇOS]
 DROP POLICY IF EXISTS policies_addresses_update ON addresses;
 CREATE POLICY policies_addresses_update ON addresses
 FOR UPDATE
@@ -992,11 +1056,11 @@ USING (
 );
 
 
-
 -- ============================================================================
 -- REFRESH_TOKEN
 -- ============================================================================
 
+-- [Apenas usuário postgres manipula a tabela refresh_tokens]
 ALTER TABLE refresh_tokens ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON refresh_tokens FROM PUBLIC;
 
@@ -1119,29 +1183,6 @@ EXECUTE FUNCTION fn_audit_operation();
 -- ============================================================================
 
 ALTER TABLE logs ENABLE ROW LEVEL SECURITY;
-
-
--- ============================================================================
--- ÍNDICES PARA PERFORMANCE COM RLS
--- ============================================================================
-
--- Índices para tenant_id (crítico para performance de RLS)
-CREATE INDEX IF NOT EXISTS idx_products_tenant_id ON products(tenant_id);
-CREATE INDEX IF NOT EXISTS idx_categories_tenant_id ON categories(tenant_id);
-CREATE INDEX IF NOT EXISTS idx_suppliers_tenant_id ON suppliers(tenant_id);
-CREATE INDEX IF NOT EXISTS idx_tax_groups_tenant_id ON tax_groups(tenant_id);
-CREATE INDEX IF NOT EXISTS idx_users_tenant_id ON users(tenant_id);
-CREATE INDEX IF NOT EXISTS idx_sales_tenant_id ON sales(tenant_id);
-
--- Índices compostos para queries comuns com RLS
-CREATE INDEX IF NOT EXISTS idx_sales_tenant_status ON sales(tenant_id, status);
-CREATE INDEX IF NOT EXISTS idx_products_tenant_active ON products(tenant_id, is_active);
-CREATE INDEX IF NOT EXISTS idx_users_tenant_created ON users(tenant_id, created_at DESC);
-
--- Índices para funções auxiliares
-CREATE INDEX IF NOT EXISTS idx_user_roles_user_id ON user_roles(id);
-CREATE INDEX IF NOT EXISTS idx_sale_items_sale_id ON sale_items(sale_id);
-CREATE INDEX IF NOT EXISTS idx_stock_movements_product_id ON stock_movements(product_id);
 
 
 -- ============================================================================

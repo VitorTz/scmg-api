@@ -84,7 +84,6 @@ async def get_user_by_id(id: str | UUID, conn: Connection) -> UserResponse:
 
 
 async def create_user(
-    owner: UserResponse, 
     new_user: UserCreate,
     new_user_password_hash: Optional[str],
     conn: Connection
@@ -101,8 +100,7 @@ async def create_user(
                 password_hash,
                 phone,
                 cpf,
-                credit_limit,
-                tenant_id
+                credit_limit
             )
             VALUES
                 ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
@@ -117,8 +115,7 @@ async def create_user(
                 invoice_amount,
                 created_at,
                 updated_at,
-                created_by,
-                tenant_id
+                created_by
         """,
         new_user.name,
         new_user.nickname,
@@ -128,8 +125,7 @@ async def create_user(
         new_user_password_hash,
         new_user.phone,
         new_user.cpf,
-        new_user.credit_limit,
-        owner.tenant_id        
+        new_user.credit_limit
     )    
 
     if not row: return None

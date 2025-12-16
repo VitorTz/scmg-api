@@ -126,21 +126,26 @@ CREATE TABLE IF NOT EXISTS tenants (
     CONSTRAINT tenants_unique_cnpj UNIQUE (cnpj)
 );
 
-
 -- ============================================================================
 -- CATEGORIES - Organização hierárquica de produtos
 -- ============================================================================
+
 CREATE TABLE IF NOT EXISTS categories (
     id SERIAL PRIMARY KEY,
     name CITEXT NOT NULL,
     parent_category_id INTEGER,    
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     tenant_id UUID NOT NULL,
+    created_by UUID,
     CONSTRAINT categories_name_length_cstr CHECK (length(name) <= 64 AND length(name) >= 3),
     CONSTRAINT categories_name_unique_cstr UNIQUE (name, tenant_id),
     FOREIGN KEY (parent_category_id) REFERENCES categories(id) ON DELETE SET NULL ON UPDATE CASCADE,
-    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE ON UPDATE CASCADE
+    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE ON UPDATE CASCADE,
+    FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE
 );
+
+CREATE INDEX IF NOT EXISTS idx_categories_parent ON categories(parent_category_id);
+CREATE INDEX IF NOT EXISTS idx_categories_tenant_id ON categories(tenant_id);
 
 
 -- ============================================================================
@@ -155,14 +160,17 @@ CREATE TABLE IF NOT EXISTS suppliers (
     contact_name TEXT,
     address TEXT,
     tenant_id UUID NOT NULL,
+    created_by UUID,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT suppliers_cnpj_length_check CHECK ((length(cnpj) <= 20)),
     CONSTRAINT suppliers_phone_length_check CHECK ((length(phone) = 11)),
     CONSTRAINT suppliers_cnpj_unique UNIQUE (cnpj, tenant_id),
     CONSTRAINT suppliers_name_unique UNIQUE (name, tenant_id),
-    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE ON UPDATE CASCADE
+    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE ON UPDATE CASCADE,
+    FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE
 );
 
+CREATE INDEX IF NOT EXISTS idx_suppliers_tenant_id ON suppliers(tenant_id);
 
 -- ============================================================================
 -- TRIBUTAÇÃO - Grupos fiscais e impostos
@@ -177,8 +185,12 @@ CREATE TABLE IF NOT EXISTS tax_groups (
     pis_rate NUMERIC(5,2) DEFAULT 0,
     cofins_rate NUMERIC(5,2) DEFAULT 0,
     tenant_id UUID NOT NULL,
+    created_by UUID,
+    FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE,
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE ON UPDATE CASCADE
 );
+
+CREATE INDEX IF NOT EXISTS idx_tax_groups_tenant_id ON tax_groups(tenant_id);
 
 -- ============================================================================
 -- PRODUTOS - Cadastro principal de mercadorias
@@ -222,6 +234,7 @@ CREATE TABLE IF NOT EXISTS products (
     needs_preparation BOOLEAN NOT NULL DEFAULT FALSE,
 
     tenant_id UUID NOT NULL,
+    created_by UUID,
 
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -229,13 +242,20 @@ CREATE TABLE IF NOT EXISTS products (
     FOREIGN KEY (category_id) REFERENCES categories(id) ON UPDATE CASCADE,
     FOREIGN KEY (tax_group_id) REFERENCES tax_groups(id) ON DELETE SET NULL ON UPDATE CASCADE,
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE ON UPDATE CASCADE,
+    FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE,
     CONSTRAINT products_name_unique_cstr UNIQUE (name, tenant_id),
     CONSTRAINT products_gtin_unique_cstr UNIQUE (gtin, tenant_id),
     CONSTRAINT products_unique_sku_cstr UNIQUE (sku, tenant_id),
     CONSTRAINT products_sku_chk CHECK ((length(sku) >= 2 AND length(sku) <= 128))
 );
 
-COMMENT ON COLUMN products.needs_preparation IS 'TRUE para produtos preparados (receitas), como caipirinhas ou lanches';
+CREATE INDEX IF NOT EXISTS idx_products_tenant_category_active ON products(tenant_id, category_id, is_active) WHERE is_active = TRUE;
+CREATE INDEX IF NOT EXISTS idx_products_name ON products USING gin(name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_products_tenant_active ON products(tenant_id, is_active);
+CREATE INDEX IF NOT EXISTS idx_products_tenant_sku ON products(tenant_id, sku);
+CREATE INDEX IF NOT EXISTS idx_products_tenant_gtin ON products(tenant_id, gtin);
+CREATE INDEX IF NOT EXISTS idx_products_tenant_category ON products(tenant_id, category_id);
+CREATE INDEX IF NOT EXISTS idx_products_low_stock ON products(stock_quantity, min_stock_quantity) WHERE stock_quantity <= min_stock_quantity AND is_active = TRUE;
 
 -- ============================================================================
 -- RECEITAS - Composição de produtos preparados
@@ -267,15 +287,21 @@ CREATE TABLE IF NOT EXISTS batches (
     expiration_date DATE NOT NULL,
     quantity NUMERIC(10, 3) NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    tenant_id UUID NOT NULL,
+    created_by UUID,
+    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE ON UPDATE CASCADE,
     FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE,
+    FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE,
     CONSTRAINT batches_batch_code_length_cstr CHECK (length(batch_code) <= 64),
     CONSTRAINT batches_quantity_valid CHECK (quantity >= 0.000)
 );
 
+CREATE INDEX IF NOT EXISTS idx_batches_product ON batches(product_id);
+CREATE INDEX IF NOT EXISTS idx_batches_expiration ON batches(expiration_date);
+
 -- ============================================================================
 -- USUÁRIOS - Cadastro de funcionários e clientes
 -- ============================================================================
-
 
 CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -297,9 +323,10 @@ CREATE TABLE IF NOT EXISTS users (
     failed_login_attempts INTEGER DEFAULT 0,
     account_locked_until TIMESTAMP,
 
+    -- Auditoria
     tenant_id UUID NOT NULL,
-
     created_by UUID,
+
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
@@ -331,14 +358,29 @@ COMMENT ON COLUMN users.invoice_amount IS 'Valor total em aberto (dívidas não 
 COMMENT ON COLUMN users.state_tax_indicator IS 'Indicador fiscal: 1=Contribuinte ICMS, 2=Isento, 9=Não Contribuinte';
 COMMENT ON COLUMN users.notes IS 'Observações sobre o usuário (ex: "Sempre paga em dia", "Preferência por cerveja X")';
 
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+CREATE INDEX IF NOT EXISTS idx_users_cpf ON users(cpf);
+CREATE INDEX IF NOT EXISTS idx_users_name ON users USING gin(name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_users_tenant_id ON users(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_users_tenant_cpf ON users(tenant_id, cpf) WHERE cpf IS NOT NULL;
+
+
+-- ============================================================================
+-- USER_ROLES - Função de cada funcionáio/membro de um tenant
+-- ============================================================================
 
 CREATE TABLE IF NOT EXISTS user_roles (
     id UUID NOT NULL,
     role user_role_enum NOT NULL DEFAULT 'CLIENTE',
+    tenant_id UUID NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (id, role),
-    FOREIGN KEY (id) REFERENCES users(id) ON DELETE CASCADE
+    FOREIGN KEY (id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE ON UPDATE CASCADE
 );
+
+CREATE INDEX IF NOT EXISTS idx_user_roles_tenant_role ON user_roles (tenant_id, role);
+CREATE INDEX IF NOT EXISTS idx_user_roles_user_id ON user_roles(id);
 
 -- ============================================================================
 -- ENDEREÇOS - Endereços de usuários/clientes
@@ -362,15 +404,16 @@ CREATE TABLE IF NOT EXISTS addresses (
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-
 CREATE TABLE IF NOT EXISTS user_addresses (
     user_id UUID NOT NULL,
     cep TEXT NOT NULL,
     descr TEXT,
     number TEXT,
+    tenant_id UUID NOT NULL,
     PRIMARY KEY (user_id, cep),    
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE ON UPDATE CASCADE,
-    FOREIGN KEY (cep) REFERENCES addresses(cep) ON DELETE CASCADE ON UPDATE CASCADE
+    FOREIGN KEY (cep) REFERENCES addresses(cep) ON DELETE CASCADE ON UPDATE CASCADE,
+    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE ON UPDATE CASCADE
 );
 
 -- ============================================================================
@@ -387,6 +430,8 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
     revoked BOOLEAN DEFAULT FALSE,
     family_id UUID NOT NULL,
     replaced_by UUID REFERENCES refresh_tokens(id),
+    CONSTRAINT refresh_tokens_valid_token_hash CHECK (length(token_hash) = 64 AND token_hash ~ '^[a-f0-9]{64}$'),
+    CONSTRAINT refresh_tokens_valid_device_hash CHECK (length(device_hash) = 64 AND device_hash ~ '^[a-f0-9]{64}$'),
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE ON UPDATE CASCADE
 );
 
@@ -412,8 +457,8 @@ CREATE TABLE IF NOT EXISTS price_audits (
     FOREIGN KEY (changed_by) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE
 );
 
-COMMENT ON TABLE price_audits IS 'Histórico de alterações de preços de produtos';
-COMMENT ON COLUMN price_audits.changed_by IS 'Usuário que realizou a alteração de preço';
+CREATE INDEX IF NOT EXISTS idx_price_audits_product ON price_audits(product_id);
+CREATE INDEX IF NOT EXISTS idx_price_audits_changed_at ON price_audits(changed_at DESC);
 
 -- ============================================================================
 -- MOVIMENTAÇÃO DE ESTOQUE - Todas as entradas e saídas
@@ -427,9 +472,11 @@ CREATE TABLE IF NOT EXISTS stock_movements (
     reference_id UUID,
     reason TEXT,
     created_by UUID,
+    tenant_id UUID NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (product_id) REFERENCES products(id) ON UPDATE CASCADE,
-    FOREIGN KEY (created_by) REFERENCES users(id) ON UPDATE CASCADE ON DELETE SET NULL
+    FOREIGN KEY (created_by) REFERENCES users(id) ON UPDATE CASCADE ON DELETE SET NULL,
+    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE ON UPDATE CASCADE
 );
 
 COMMENT ON TABLE stock_movements IS 'Registro de todas as movimentações de estoque (entradas e saídas)';
@@ -437,6 +484,17 @@ COMMENT ON COLUMN stock_movements.type IS 'Tipo: VENDA, COMPRA, DEVOLUCAO, PERDA
 COMMENT ON COLUMN stock_movements.quantity IS 'Quantidade movimentada (positivo=entrada, negativo=saída)';
 COMMENT ON COLUMN stock_movements.reference_id IS 'ID da venda/compra relacionada (se aplicável)';
 COMMENT ON COLUMN stock_movements.reason IS 'Motivo da movimentação (ex: "Venda #123", "Produto vencido")';
+
+CREATE INDEX IF NOT EXISTS idx_stock_movements_product ON stock_movements(product_id);
+CREATE INDEX IF NOT EXISTS idx_stock_movements_type ON stock_movements(type);
+CREATE INDEX IF NOT EXISTS idx_stock_movements_created ON stock_movements(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_stock_movements_reference ON stock_movements(reference_id);
+CREATE INDEX IF NOT EXISTS idx_stock_movements_tenant_created ON stock_movements(tenant_id, created_at DESC, type);
+
+ALTER TABLE stock_movements SET (
+    autovacuum_vacuum_scale_factor = 0.05,
+    autovacuum_analyze_scale_factor = 0.02
+);
 
 -- ============================================================================
 -- VENDAS - Cabeçalho das vendas
@@ -456,14 +514,17 @@ CREATE TABLE IF NOT EXISTS sales (
     cancelled_at TIMESTAMP,
     cancellation_reason TEXT,
 
+    -- Auditoria
     tenant_id UUID NOT NULL,
+    created_by UUID,
 
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     finished_at TIMESTAMP,
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE ON UPDATE CASCADE,
     FOREIGN KEY (salesperson_id) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE,
     FOREIGN KEY (customer_id) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE,
-    FOREIGN KEY (cancelled_by) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE
+    FOREIGN KEY (cancelled_by) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE,
+    FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE
 );
 
 COMMENT ON TABLE sales IS 'Cabeçalho das vendas realizadas';
@@ -474,6 +535,59 @@ COMMENT ON COLUMN sales.status IS 'Status: ABERTA, CONCLUIDA, CANCELADA, EM_ENTR
 COMMENT ON COLUMN sales.salesperson_id IS 'Funcionário que realizou a venda';
 COMMENT ON COLUMN sales.customer_id IS 'Cliente que realizou a compra (opcional)';
 COMMENT ON COLUMN sales.finished_at IS 'Data/hora da conclusão da venda';
+
+CREATE INDEX IF NOT EXISTS idx_sales_status ON sales(status);
+CREATE INDEX IF NOT EXISTS idx_sales_customer ON sales(customer_id);
+CREATE INDEX IF NOT EXISTS idx_sales_salesperson ON sales(salesperson_id);
+CREATE INDEX IF NOT EXISTS idx_sales_created_at ON sales(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sales_finished_at ON sales(finished_at DESC) WHERE finished_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_sales_tenant_id ON sales(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_sales_tenant_status ON sales(tenant_id, status);
+CREATE INDEX IF NOT EXISTS idx_sales_tenant_status_created ON sales(tenant_id, status, created_at DESC) WHERE status = 'ABERTA';
+
+ALTER TABLE sales SET (
+    autovacuum_vacuum_scale_factor = 0.05
+);
+
+-- [PARA GERENCIAR CANCELAMENTO DE VENDA]
+CREATE OR REPLACE FUNCTION fn_handle_sale_cancellation()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.status = 'CANCELADA' AND OLD.status != 'CANCELADA' THEN
+        -- Reverte estoque de todos os itens
+        INSERT INTO stock_movements (product_id, type, quantity, reference_id, reason, created_by, tenant_id)
+        SELECT 
+            si.product_id,
+            'CANCELAMENTO'::stock_movement_enum,
+            si.quantity, -- Quantidade POSITIVA para devolver ao estoque
+            NEW.id,
+            'Cancelamento de venda #' || NEW.id,
+            NEW.cancelled_by,
+            NEW.tenant_id
+        FROM sale_items si
+        WHERE si.sale_id = NEW.id;
+        
+        -- Atualiza estoque dos produtos
+        UPDATE products p
+        SET stock_quantity = stock_quantity + si.quantity
+        FROM sale_items si
+        WHERE si.sale_id = NEW.id 
+        AND p.id = si.product_id;
+        
+        -- Reverte dívida do cliente se foi fiado
+        IF NEW.customer_id IS NOT NULL THEN
+            PERFORM calculate_user_debt_balance(NEW.customer_id);
+        END IF;
+    END IF;
+    
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+
+CREATE OR REPLACE TRIGGER trg_handle_sale_cancellation
+AFTER UPDATE OF status ON sales
+FOR EACH ROW EXECUTE FUNCTION fn_handle_sale_cancellation();
 
 -- ============================================================================
 -- ITENS DE VENDA - Produtos vendidos em cada venda
@@ -497,6 +611,9 @@ COMMENT ON COLUMN sale_items.unit_sale_price IS 'Preço de venda unitário no mo
 COMMENT ON COLUMN sale_items.unit_cost_price IS 'Custo unitário no momento da venda (para cálculo de lucro real)';
 COMMENT ON COLUMN sale_items.subtotal IS 'Valor total do item (quantidade × preço unitário)';
 
+CREATE INDEX IF NOT EXISTS idx_sale_items_sale ON sale_items(sale_id);
+CREATE INDEX IF NOT EXISTS idx_sale_items_product ON sale_items(product_id);
+
 -- ============================================================================
 -- PAGAMENTOS DE VENDAS - Formas de pagamento utilizadas
 -- ============================================================================
@@ -513,6 +630,10 @@ CREATE TABLE IF NOT EXISTS sale_payments (
 COMMENT ON TABLE sale_payments IS 'Formas de pagamento utilizadas em cada venda (pode haver múltiplas)';
 COMMENT ON COLUMN sale_payments.method IS 'Método: DINHEIRO, CREDITO, DEBITO, PIX, FIADO, etc';
 COMMENT ON COLUMN sale_payments.total IS 'Valor pago através deste método';
+
+CREATE INDEX IF NOT EXISTS idx_sale_payments_sale ON sale_payments(sale_id);
+CREATE INDEX IF NOT EXISTS idx_sale_payments_method ON sale_payments(method);
+CREATE INDEX IF NOT EXISTS idx_sale_payments_created ON sale_payments(created_at DESC);
 
 -- ============================================================================
 -- PAGAMENTOS DE FIADO - Quitação de dívidas
@@ -536,6 +657,8 @@ COMMENT ON COLUMN tab_payments.amount_paid IS 'Valor pago neste pagamento parcia
 COMMENT ON COLUMN tab_payments.payment_method IS 'Forma de pagamento utilizada na quitação';
 COMMENT ON COLUMN tab_payments.received_by IS 'Funcionário que recebeu o pagamento';
 
+CREATE INDEX IF NOT EXISTS idx_tab_payments_sale ON tab_payments(sale_id);
+CREATE INDEX IF NOT EXISTS idx_tab_payments_created ON tab_payments(created_at DESC);
 
 CREATE OR REPLACE FUNCTION calculate_user_debt_balance(target_user_id UUID) 
 RETURNS NUMERIC AS $$
@@ -569,6 +692,7 @@ CREATE OR REPLACE FUNCTION trg_update_user_invoice_amount()
 RETURNS TRIGGER AS $$
 DECLARE
     affected_customer_id UUID;
+    new_balance NUMERIC(10,2);
 BEGIN
     -- Descobre quem é o cliente afetado dependendo da tabela de origem
     
@@ -587,8 +711,17 @@ BEGIN
 
     -- Se existe um cliente vinculado, atualiza o saldo dele
     IF affected_customer_id IS NOT NULL THEN
-        UPDATE users 
-        SET invoice_amount = calculate_user_debt_balance(affected_customer_id),
+        -- Lock pessimista para evitar race condition
+        SELECT id INTO affected_customer_id 
+        FROM users 
+        WHERE id = affected_customer_id
+        FOR UPDATE;
+        
+        -- Calcula e atualiza atomicamente
+        new_balance := calculate_user_debt_balance(affected_customer_id);
+        
+        UPDATE users
+        SET invoice_amount = new_balance,
             updated_at = CURRENT_TIMESTAMP
         WHERE id = affected_customer_id;
     END IF;
@@ -612,7 +745,6 @@ CREATE OR REPLACE TRIGGER trg_audit_debt_sales_status
 AFTER UPDATE OF status, customer_id ON sales
 FOR EACH ROW EXECUTE FUNCTION trg_update_user_invoice_amount();
 
-
 -- ============================================================================
 -- LOGS - Registro de eventos do sistema
 -- ============================================================================
@@ -634,6 +766,14 @@ COMMENT ON TABLE logs IS 'Registro de logs do sistema para auditoria e debugging
 COMMENT ON COLUMN logs.level IS 'Nível de severidade do log';
 COMMENT ON COLUMN logs.metadata IS 'Dados adicionais em formato JSON';
 
+CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
+CREATE INDEX IF NOT EXISTS idx_logs_created_at ON logs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_logs_metadata ON logs USING gin(metadata);
+
+ALTER TABLE logs SET (
+    autovacuum_vacuum_scale_factor = 0.1,
+    toast_tuple_target = 8160
+);
 
 -- ============================================================================
 -- USER FEEDBACK
@@ -652,10 +792,10 @@ CREATE TABLE IF NOT EXISTS user_feedbacks (
 );
 
 -- ============================================================================
--- Currency
+-- Currencies
 -- ============================================================================
 
-CREATE TABLE IF NOT EXISTS currency_values (
+CREATE TABLE IF NOT EXISTS currencies (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     usd NUMERIC(18, 6) NOT NULL,
     ars NUMERIC(18, 6) NOT NULL,
@@ -666,19 +806,13 @@ CREATE TABLE IF NOT EXISTS currency_values (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP    
 );
 
--- Simple B-tree index (best for ranges, ORDER BY, comparisons)
-CREATE INDEX IF NOT EXISTS idx_currency_values_created_at ON currency_values(created_at);
-
--- Optional: descending index if you often query “latest first”
-CREATE INDEX IF NOT EXISTS idx_currency_values_created_at_desc ON currency_values(created_at DESC);
-
+CREATE INDEX IF NOT EXISTS idx_currencies_created_at_desc ON currencies(created_at DESC);
 
 -- ============================================================================
 -- AUDITORIA
 -- ============================================================================
 
 -- Tabela de auditoria de operações sensíveis
-
 CREATE TABLE IF NOT EXISTS security_audit_log (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     user_id UUID,
@@ -693,15 +827,25 @@ CREATE TABLE IF NOT EXISTS security_audit_log (
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE SET NULL ON UPDATE CASCADE
 );
 
+CREATE INDEX IF NOT EXISTS idx_audit_record_trace ON security_audit_log (table_name, record_id);
+CREATE INDEX IF NOT EXISTS idx_audit_user ON security_audit_log (user_id);
+CREATE INDEX IF NOT EXISTS idx_audit_created_at_brin ON security_audit_log USING BRIN (created_at);
 
 -- ============================================================================
 -- TRIGGERS
 -- ============================================================================
 
+-- products
 CREATE OR REPLACE TRIGGER trg_products_updated_at
 BEFORE UPDATE ON products
 FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
+-- users
 CREATE OR REPLACE TRIGGER trg_users_updated_at
 BEFORE UPDATE ON users
+FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- addresses
+CREATE OR REPLACE TRIGGER trg_addresses_updated_at
+BEFORE UPDATE ON addresses
 FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();

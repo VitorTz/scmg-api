@@ -12,6 +12,6 @@ router = APIRouter()
 @router.post("/", status_code=status.HTTP_204_NO_CONTENT)
 async def create_feedback(
     feedback: UserFeedbackCreate, 
-    rls: Connection = Depends(get_postgres_connection)
+    conn: Connection = Depends(get_postgres_connection)
 ):
-    return await db_safe_exec(user_feedback_model.create_user_feedback(feedback, rls.co))
+    return await db_safe_exec(user_feedback_model.create_user_feedback(feedback, conn))

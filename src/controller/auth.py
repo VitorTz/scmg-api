@@ -145,8 +145,11 @@ async def refresh(
 
 
 async def signup(user: UserCreate, rls: RLSConnection) -> UserResponse:
-    p = security.hash_password(user.password) if user.password else None
-    return await db_safe_exec(user_model.create_user(rls.user, user, p, rls.conn))
+    return await db_safe_exec(user_model.create_user(
+        user, 
+        security.hash_password(user.password) if user.password else None, 
+        rls.conn
+    ))
 
 
 async def logout(refresh_token: str, response: Response, conn: Connection) -> None:
