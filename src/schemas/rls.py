@@ -1,17 +1,17 @@
+from pydantic import BaseModel
+from asyncpg import Connection, Record
 from src.schemas.user import UserResponse
-from asyncpg import Connection
+from typing import Optional
+ 
 
 
-class RLSConnection:
+class RLSConnection(BaseModel):
     
-    def __init__(self, user: UserResponse, conn: Connection):
-        self.__user = user
-        self.__conn = conn
+    user: Record
+    conn: Connection
+
+
+class AdminConnectionWithUser(BaseModel):
     
-    @property
-    def user(self) -> UserResponse:
-        return self.__user
-    
-    @property
-    def conn(self) -> Connection:
-        return self.__conn
+    user: Optional[UserResponse]
+    conn: Connection

@@ -103,3 +103,7 @@ async def convert_upload_to_webp(file: UploadFile, quality: int = 80) -> io.Byte
     buffer.seek(0)
 
     return buffer
+
+
+def make_role_string(roles: list[str]) -> None:
+    return "{" + ",".join(sorted(roles)) + "}"

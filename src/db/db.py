@@ -33,8 +33,8 @@ class Database:
             
     async def migrations(self, conn: asyncpg.Connection) -> None:
         await self.execute_sql_file(Path("src/db/schema.sql"), conn)
-        await self.execute_sql_file(Path("src/db/rls.sql"), conn)
-        await self.execute_sql_file(Path("src/db/view.sql"), conn)
+        # await self.execute_sql_file(Path("src/db/rls.sql"), conn)
+        # await self.execute_sql_file(Path("src/db/view.sql"), conn)
 
     async def connect(self):
         print("[DB] [INICIANDO CONEXÃO]")

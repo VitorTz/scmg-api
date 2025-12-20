@@ -1,7 +1,7 @@
 from fastapi import Depends, HTTPException, status, Cookie, Response, Header
 from datetime import datetime, timedelta, timezone
 from src.schemas.token import Token, RefreshTokenCreate, DecodedRefreshToken, DecodedAccessToken
-from src.schemas.rls import RLSConnection
+from src.schemas.rls import RLSConnection, AdminConnectionWithUser
 from src.schemas.user import UserResponse
 from src.constants import Constants
 from passlib.context import CryptContext
@@ -12,7 +12,6 @@ from asyncpg import Pool
 from src.model import user as user_model
 from src.db.db import get_db_pool
 from src import util
-from typing import List, Any, AsyncGenerator
 import secrets
 import hashlib
 import json
@@ -214,36 +213,48 @@ def decode_refresh_token(refresh_token: Optional[str]) -> DecodedRefreshToken:
         raise CREDENTIALS_EXCEPTION
     
 
+async def extract_user( 
+    pool: Pool = Depends(get_db_pool),
+    access_token: Optional[str] = Cookie(default=None),
+    x_device_id: str = Header(...)
+):
+    user_data: DecodedAccessToken = decode_access_token(access_token, x_device_id)    
+    async with pool.acquire() as connection:        
+        async with connection.transaction():
+            user: Optional[UserResponse] = await user_model.get_user_by_id(user_data.user_id, connection)
+            yield AdminConnectionWithUser(user=user, conn=connection)
+            
 
 async def get_rls_connection(
     pool: Pool = Depends(get_db_pool),
     access_token: Optional[str] = Cookie(default=None),
-    x_device_id: str = Header(...)    
+    x_device_id: str = Header(...)
 ):
-    user_data: DecodedAccessToken = decode_access_token(access_token, x_device_id)
-    
+    user_data: DecodedAccessToken = decode_access_token(access_token, x_device_id)    
     async with pool.acquire() as connection:        
         async with connection.transaction():
             try:
-                user = await user_model.get_user_by_id(user_data.user_id, connection)                
-                if not user: raise CREDENTIALS_EXCEPTION
-                await connection.execute("SET LOCAL ROLE app_runtime")
+                row = await user_model.get_user_rls_data(user_data.user_id, connection)
+                if not row: raise CREDENTIALS_EXCEPTION
+                await connection.execute("SET LOCAL ROLE app_runtime")                            
                 await connection.execute(
                     """
-                    SELECT set_config('app.current_user_id', $1, true),
-                           set_config('app.current_user_role', $2, true),
-                           set_config('app.current_tenant_id', $3, true)
+                    SELECT set_config('app.current_user_id', $1::text, true),
+                           set_config('app.current_user_roles', $2, true),
+                           set_config('app.current_user_tenant_id', $3::text, true),
+                           set_config('app.current_user_max_privilege', $4::text, true)
                     """,
-                    str(user.id),
-                    "{" + ",".join(user.roles) + "}",
-                    str(user.tenant_id)
+                    row['id'],
+                    row['roles'],
+                    row['tenant_id'],
+                    row['max_privilege_level']
                 )
                 
             except Exception as e:
                 print(f"[CRITICAL] Erro ao configurar sessão RLS: {e}")
                 raise DatabaseError(code=500, detail="Security context failure.")
             
-            yield RLSConnection(user, connection)
+            yield RLSConnection(row, connection)
 
 
 async def get_postgres_connection(pool: Pool = Depends(get_db_pool)):

@@ -1,6 +1,6 @@
 from src.schemas.user import LoginData, UserResponse, UserCreate
 from src.schemas.auth import LoginRequest
-from asyncpg import Connection
+from asyncpg import Connection, Record
 from typing import Optional
 from uuid import UUID
 import re
@@ -81,6 +81,23 @@ async def get_user_by_id(id: str | UUID, conn: Connection) -> UserResponse:
         id
     )
     return UserResponse(**dict(row)) if row else None
+
+
+async def get_user_rls_data(id: str | UUID, conn: Connection) -> Record:
+    return await conn.fetchrow(
+        """
+            SELECT
+                id,
+                tenant_id,
+                roles,
+                max_privilege_level
+            FROM
+                users u
+            WHERE
+                id = id
+        """,
+        id
+    )
 
 
 async def create_user(

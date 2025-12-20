@@ -1,6 +1,10 @@
 -- ============================================================================
--- SCMG - SCHEMA COMPLETO (V2.1)
--- Sistema de gestão para pequeno comércio com bar, lanchonete e mercearia
+-- SCHEMA - SCMG
+-- Sistema de gestão para pequeno comércio com bar, lanchonete, mercearia e lojas
+-- ============================================================================
+
+-- ============================================================================
+-- EXTENSIONS
 -- ============================================================================
 
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
@@ -27,61 +31,189 @@ GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO app_runtime;
 
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO app_runtime;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO app_runtime;
+ALTER ROLE app_runtime SET row_security = on;
 
 -- ============================================================================
--- ENUMS - Tipos enumerados para padronização de dados
+-- ENUMS
 -- ============================================================================
 
 DO $$ BEGIN
     -- Métodos de pagamento aceitos no estabelecimento
     CREATE TYPE payment_method_enum AS ENUM (
+        -- Básicos
         'DINHEIRO',
-        'CREDITO',
-        'DEBITO',
         'PIX',
-        'FIADO-EM-ABERTO',
-        'FIADO-PAGO-PARCIAL',
-        'FIADO-QUITADO',
-        'VALE_ALIMENTACAO'        
+        
+        -- Cartões (Importante separar para taxas de maquininha)
+        'CARTAO_CREDITO',
+        'CARTAO_DEBITO',
+        
+        -- Voucher / Benefícios (Crucial diferenciar para Mercados vs Restaurantes)
+        'VALE_ALIMENTACAO',    -- VA (Supermercados)
+        'VALE_REFEICAO',       -- VR (Restaurantes/Bares)
+        'VALE_PRESENTE',       -- Gift Card da própria loja
+        'VALE_COMBUSTIVEL',    -- Postos
+
+        -- Crédito Loja / Interno
+        'CREDIARIO',           -- O famoso "Fiado" ou "Conta Cliente"
+        'CASHBACK',            -- Pagamento usando saldo de fidelidade/pontos
+        'PERMUTA',             -- Troca de serviços/produtos (sem financeiro real)
+
+        -- Bancário / B2B
+        'BOLETO_BANCARIO',     -- Vendas a prazo com documento
+        'TRANSFERENCIA_BANCARIA', -- TED/DOC (Mais raro no varejo, comum no B2B)
+        'CHEQUE',              -- Ainda usado em atacados e cidades do interior
+
+        -- Integrações Externas
+        'CARTEIRA_DIGITAL',    -- PicPay, MercadoPago (quando não é via PIX direto)
+        'APP_DELIVERY',        -- iFood/Rappi (O pagamento foi feito online, o dinheiro entra via repasse)
+        
+        -- Outros
+        'SEM_PAGAMENTO',       -- Para bonificações ou cortesias 
+        'OUTROS'
     );
     
     -- Tipos de movimentação de estoque
     CREATE TYPE stock_movement_enum AS ENUM (
-        'VENDA', 
-        'COMPRA', 
-        'DEVOLUCAO_VENDA', 
-        'DEVOLUCAO_FORNECEDOR', 
-        'PERDA', 
-        'AJUSTE', 
-        'CONSUMO_INTERNO', 
+        -- Operações Normais
+        'VENDA',                -- Saída por venda fiscal
+        'COMPRA',               -- Entrada por nota fiscal de fornecedor
+        'BONIFICACAO',          -- Entrada gratuita (brinde de fornecedor) - não gera custo, mas gera estoque
+
+        -- Devoluções (Logística Reversa)
+        'DEVOLUCAO_CLIENTE',    -- Entrada (Cliente devolveu produto)
+        'DEVOLUCAO_FORNECEDOR', -- Saída (Devolução de lote com defeito para a fábrica)
+
+        -- Perdas e Quebras (Saídas Negativas)
+        'PERDA',                -- Perda genérica (sumiu)
+        'QUEBRA',               -- Acidente operacional (derrubou a garrafa)
+        'VENCIMENTO',           -- Produto estragou/venceu validade
+        'FURTO',                -- Furto identificado
+        'AVARIA',               -- Produto danificado (riscado, amassado)
+
+        -- Ajustes Administrativos
+        'AJUSTE_ENTRADA',       -- Correção manual de inventário (+1)
+        'AJUSTE_SAIDA',         -- Correção manual de inventário (-1)
+        'INVENTARIO_INICIAL',   -- Carga inicial do sistema
+
+        -- Uso Interno
+        'CONSUMO_INTERNO',      -- Os funcionários comeram/usaram (café, limpeza)
+        'DEGUSTACAO',           -- Aberto para cliente provar (marketing)
+
+        -- Produção (Ficha Técnica / Transformação)
+        -- Ex: Sai 200g de Farinha (PRODUCAO_SAIDA) -> Entra 1 Pão (PRODUCAO_ENTRADA)
+        'PRODUCAO_ENTRADA',     -- Entrada do produto acabado
+        'PRODUCAO_SAIDA',       -- Baixa dos insumos/ingredientes
+
+        -- Movimentação entre Locais (Filiais/Depósitos)
+        'TRANSFERENCIA_ENTRADA',
+        'TRANSFERENCIA_SAIDA',
+
         'CANCELAMENTO'
     );
     
     -- Papéis/funções dos usuários no sistema
     CREATE TYPE user_role_enum AS ENUM (
-        'ADMIN',
-        'CAIXA', 
-        'GERENTE', 
-        'CLIENTE',
-        'ESTOQUISTA',
-        'CONTADOR'
+        -- Alto Nível / Administrativo
+        'ADMIN',        -- Acesso total (Dono)
+        'GERENTE',      -- Gestão de equipe, relatórios, anulações, sangrias
+        'CONTADOR',     -- Acesso apenas a relatórios fiscais e XMLs
+        'FINANCEIRO',   -- Contas a pagar/receber, DRE (diferente do Contador e do Caixa)
+
+        -- Operacional Varejo (Supermercados/Lojas)
+        'CAIXA',        -- Frente de loja (PDV), abertura/fechamento
+        'FISCAL_CAIXA', -- (Supervisor) Libera descontos, cancelamentos no PDV, mas não gerencia a loja toda
+        'VENDEDOR',     -- Focado em comissão/pré-venda (comum em lojas de roupa/eletrônicos). Cria o pedido, mas o Caixa cobra.
+        'REPOSITOR',    -- Focado em conferência de preço na gôndola e organização (não necessariamente mexe no estoque sistêmico)
+        'ESTOQUISTA',   -- Entrada de NF, inventário, conferência cega
+        'COMPRADOR',    -- Gera ordens de compra, negocia com fornecedor (diferente de quem recebe a mercadoria)
+
+        -- Operacional Gastronomia (Bares/Restaurantes)
+        'GARCOM',       -- Lança pedidos em mesas/comandas, transfere itens, pede fechamento (Mobile)
+        'COZINHA',      -- Acesso a telas KDS (Kitchen Display System), baixa de insumos de produção
+        'BARMAN',       -- Similar a cozinha, mas focado no bar (pode ter permissão de "auto-serviço" se lançar direto)
+        'ENTREGADOR',   -- Acesso ao módulo de Delivery (rotas, confirmar entrega, baixa no app)
+
+        -- Acesso Externo
+        'CLIENTE'       -- Autoatendimento, Ecommerce ou App de fidelidade
     );
     
     -- Status possíveis de uma venda
     CREATE TYPE sale_status_enum AS ENUM (
-        'ABERTA', 
-        'CONCLUIDA', 
-        'CANCELADA', 
-        'EM_ENTREGA'        
+        -- Fluxo Básico (Varejo Rápido)
+        'ABERTA',               -- Venda no carrinho, sendo passada no caixa
+        'CONCLUIDA',            -- Paga e finalizada fiscalmente
+        'CANCELADA',            -- Cancelada antes do pagamento
+
+        -- Fluxo Financeiro/Pré-Venda
+        'ORCAMENTO',            -- Cotação que ainda não virou venda (não baixa estoque)
+        'AGUARDANDO_PAGAMENTO', -- Comum para PIX online ou Link de Pagamento
+        'FIADO_PENDENTE',       -- Venda concluída na "caderneta", mas dinheiro não entrou no caixa ainda
+
+        -- Fluxo Gastronomia (Cozinha/KDS)
+        'EM_PREPARO',           -- Enviado para a cozinha/bar
+        'PRONTO_SERVIR',        -- Cozinha finalizou, aguardando garçom
+
+        -- Fluxo Logística/Delivery/Ecommerce
+        'EM_SEPARACAO',         -- Pagamento aprovado, estoquista pegando itens (Picking)
+        'AGUARDANDO_ENTREGA',   -- Embalado, esperando motoboy
+        'EM_ENTREGA',           -- Saiu para entrega
+        'ENTREGUE',             -- Cliente recebeu
+        'DEVOLVIDA',            -- Cliente não encontrado ou recusou
+        
+        -- Fluxo Fiscal (Erros)
+        'REJEITADA_SEFAZ'       -- Venda bloqueada pela receita (erro de NCM, tributo, etc)
     );
     
     -- Unidades de medida para produtos
     CREATE TYPE measure_unit_enum AS ENUM (
-        'UN', 
-        'KG', 
-        'L', 
-        'CX'
+        -- Peso e Massa (Açougue, Padaria, Hortifruti)
+        'KG',  -- Quilograma
+        'G',   -- Grama (Essencial para fichas técnicas de receitas)
+        'MG',  -- Miligrama (Comum em suplementos/farmácia)
+
+        -- Volume (Bebidas, Limpeza)
+        'L',   -- Litro
+        'ML',  -- Mililitro (Doses de bebidas, latas)
+
+        -- Unitários e Embalagens (Varejo Geral)
+        'UN',  -- Unidade Simples
+        'CX',  -- Caixa (Atacado)
+        'PC',  -- Pacote (Diferente de caixa, ex: pacote de bolacha)
+        'DZ',  -- Dúzia (Ovos)
+        'FAR', -- Fardo (Refrigerantes, Cerveja)
+        'KIT', -- Kit promocional (Cesta básica, Kit churrasco)
+        'PAL', -- Palete (Logística/Atacarejo)
+        'PAR', -- Par (Calçados)
+
+        -- Dimensões (Material de Construção, Tecidos)
+        'M',   -- Metro Linear (Fios, mangueiras)
+        'M2',  -- Metro Quadrado (Pisos, Vidros)
+        'M3',  -- Metro Cúbico (Areia, Concreto)
+
+        -- Gastronomia (Bares e Restaurantes)
+        'DOS', -- Dose (Destilados)
+        'FAT', -- Fatia (Pizza, Tortas)
+        'POR', -- Porção (Batata frita, petiscos)
+
+        -- Serviços
+        'HR',  -- Hora (Consultoria, Aluguel de quadra)
+        'DIA'  -- Diária (Aluguel de equipamentos)
     );
+    
+    CREATE TYPE category_type_enum AS ENUM (
+        'PRODUCT', 
+        'SERVICE', 
+        'MODIFIER'
+    );
+
+    CREATE TYPE product_type_enum AS ENUM (
+        'STANDARD', -- Produto padrão (baixa estoque dele mesmo)
+        'SERVICE',  -- Serviço (não movimenta estoque, ex: Taxa de Entrega, Mão de Obra)
+        'COMBO',    -- Kit/Combo (baixa estoque dos componentes)
+        'MODIFIER'  -- Item adicional (ex: Adicional de Bacon, Ponto da Carne)
+    );
+
 EXCEPTION
     WHEN duplicate_object THEN null;
 END $$;
@@ -99,6 +231,113 @@ BEGIN
 END;
 $$ language 'plpgsql';
 
+
+-- Retorna o nível de privilégio de uma role (quanto maior, mais poder)
+CREATE OR REPLACE FUNCTION get_role_privilege_level(role user_role_enum)
+RETURNS INTEGER AS $$
+BEGIN
+    RETURN CASE role
+        WHEN 'ADMIN' THEN 120
+        WHEN 'GERENTE'    THEN 99
+        WHEN 'FINANCEIRO' THEN 92
+        WHEN 'CONTADOR'   THEN 80        
+        WHEN 'FISCAL' THEN 70
+        WHEN 'COMPRADOR'    THEN 60            
+        WHEN 'CAIXA'    THEN 50
+        WHEN 'VENDEDOR' THEN 50
+        WHEN 'GARCOM'   THEN 50
+        WHEN 'ESTOQUISTA' THEN 40
+        WHEN 'BARMAN'     THEN 30
+        WHEN 'COZINHA'    THEN 30
+        WHEN 'ENTREGADOR' THEN 20
+        WHEN 'REPOSITOR'  THEN 20        
+        WHEN 'CLIENTE' THEN 0
+        ELSE 0
+    END;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+
+-- Retorna o nível máximo de privilégio de um array de roles
+CREATE OR REPLACE FUNCTION get_max_privilege_from_roles(roles user_role_enum[])
+RETURNS INTEGER AS $$
+DECLARE
+    role user_role_enum;
+    max_level INTEGER := 0;
+    current_level INTEGER;
+BEGIN
+    IF roles IS NULL THEN RETURN 0; END IF;
+    FOREACH role IN ARRAY roles LOOP
+        current_level := get_role_privilege_level(role);
+        IF current_level > max_level THEN
+            max_level := current_level;
+        END IF;
+    END LOOP;
+    RETURN max_level;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+-- ============================================================================
+-- FISCAL
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS fiscal_payment_codes (
+    method payment_method_enum PRIMARY KEY,
+    sefaz_code VARCHAR(2) NOT NULL,
+    descr TEXT
+);
+
+
+-- Inserção dos dados padrão da SEFAZ (Tabela atualizada)
+INSERT INTO fiscal_payment_codes (method, sefaz_code, descr) VALUES
+    ('DINHEIRO',               '01', 'Dinheiro'),
+    ('CHEQUE',                 '02', 'Cheque'),
+    ('CARTAO_CREDITO',         '03', 'Cartão de Crédito'),
+    ('CARTAO_DEBITO',          '04', 'Cartão de Débito'),
+    ('CREDIARIO',              '05', 'Crédito Loja (Fiado)'),
+    ('VALE_ALIMENTACAO',       '10', 'Vale Alimentação'),
+    ('VALE_REFEICAO',          '11', 'Vale Refeição'),
+    ('VALE_PRESENTE',          '12', 'Vale Presente'),
+    ('VALE_COMBUSTIVEL',       '13', 'Vale Combustível'),
+    -- Códigos 14 (Duplicata Mercantil) geralmente mapeia para Boleto em alguns contextos ou Crediário
+    ('BOLETO_BANCARIO',        '15', 'Boleto Bancário'), 
+    ('TRANSFERENCIA_BANCARIA', '16', 'Depósito Bancário'),
+    ('PIX',                    '17', 'Pagamento Instantâneo (PIX)'),
+    ('CARTEIRA_DIGITAL',       '18', 'Transferência bancária, Carteira Digital'),
+    ('CASHBACK',               '19', 'Programa de Fidelidade, Cashback'),
+    ('APP_DELIVERY',           '99', 'Outros (Intermediadores)'), 
+    ('SEM_PAGAMENTO',          '90', 'Sem pagamento (Bonificação)'),
+    ('OUTROS',                 '99', 'Outros')
+ON CONFLICT
+    (method)
+DO UPDATE SET 
+    sefaz_code = EXCLUDED.sefaz_code,
+    descr = EXCLUDED.descr;
+
+-- NCM 
+CREATE TABLE IF NOT EXISTS fiscal_ncms (
+    code VARCHAR(8) NOT NULL PRIMARY KEY,
+        
+    description TEXT NOT NULL, -- Descrição oficial (Ex: "Cervejas de malte")
+    
+    -- Alíquotas aproximadas (Lei 12.741/2012 - De Olho no Imposto)
+    federal_national_rate NUMERIC(5, 2) DEFAULT 0, -- Imposto Federal (Produtos Nacionais)
+    federal_import_rate NUMERIC(5, 2) DEFAULT 0,   -- Imposto Federal (Produtos Importados)
+    state_rate NUMERIC(5, 2) DEFAULT 0,            -- Imposto Estadual (ICMS aproximado)
+    municipal_rate NUMERIC(5, 2) DEFAULT 0,        -- Imposto Municipal (Serviços)
+    
+    -- Controle de Vigência (Tabelas do IBPT expiram)
+    valid_from DATE,
+    valid_until DATE,
+    
+    -- Metadados de Importação
+    version VARCHAR(20), -- Ex: '24.1.B' (Versão da tabela IBPT)
+    
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_fiscal_ncms_description_trgm ON fiscal_ncms USING GIN (description gin_trgm_ops);
 
 -- ============================================================================
 -- CNPJS
@@ -123,30 +362,168 @@ CREATE TABLE IF NOT EXISTS tenants (
     cnpj VARCHAR(14),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     is_active BOOLEAN DEFAULT TRUE,
+    notes TEXT,
     CONSTRAINT tenants_unique_cnpj UNIQUE (cnpj)
 );
 
+
 -- ============================================================================
--- CATEGORIES - Organização hierárquica de produtos
+-- USUÁRIOS - Cadastro de funcionários e clientes
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS users (
+
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name TEXT NOT NULL,
+    nickname TEXT,
+    birth_date DATE,
+    email TEXT,
+    phone TEXT,
+    cpf VARCHAR(14),
+    image_url TEXT, -- Foto do funcionário (aparece no PDV) ou do cliente
+    
+    -- Segurança e Acesso
+    password_hash TEXT, -- Senha forte (Acesso Web/Admin)
+    quick_access_pin_hash TEXT, -- PIN numérico hasheado (Acesso rápido PDV Touch)
+    
+    -- Fiscal e Financeiro (Cliente)
+    state_tax_indicator SMALLINT DEFAULT 9,
+    loyalty_points INTEGER DEFAULT 0, -- Pontos de Fidelidade acumulados
+
+    -- Profissional (Funcionário)
+    commission_percentage NUMERIC(5, 2) DEFAULT 0, -- Ex: 10% para garçom, 2% para vendedor
+
+    max_privilege_level INTEGER GENERATED ALWAYS AS (get_max_privilege_from_roles(roles)) STORED,
+
+    -- Status e Bloqueio
+    is_active BOOLEAN NOT NULL DEFAULT TRUE, -- Soft Delete
+    last_login_at TIMESTAMP,
+    failed_login_attempts INTEGER DEFAULT 0,
+    account_locked_until TIMESTAMP,
+    notes TEXT,
+
+    -- Auditoria
+    tenant_id UUID NOT NULL,
+    created_by UUID,
+    
+    roles user_role_enum[] NOT NULL DEFAULT '{CLIENTE}',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE ON UPDATE CASCADE,
+    FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE,
+    CONSTRAINT users_email_unique_cstr UNIQUE (email, tenant_id),
+    CONSTRAINT users_cpf_unique_cstr UNIQUE (cpf, tenant_id),
+    CONSTRAINT users_valid_cpf_cstr CHECK (cpf IS NULL OR cpf ~ '^\d{11}$'),
+    CONSTRAINT users_valid_email_cstr CHECK (email IS NULL OR email ~* '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'),
+    CONSTRAINT users_name_length_cstr CHECK (length(name) BETWEEN 2 AND 256),
+    CONSTRAINT users_commission_chk CHECK (commission_percentage BETWEEN 0 AND 100)
+);
+
+-- Índices
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+CREATE INDEX IF NOT EXISTS idx_users_cpf ON users(cpf);
+CREATE INDEX IF NOT EXISTS idx_users_name ON users USING gin(name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_users_tenant_active ON users(tenant_id, is_active);
+CREATE INDEX IF NOT EXISTS idx_users_privilege_level ON users(tenant_id, max_privilege_level DESC);
+CREATE INDEX IF NOT EXISTS idx_users_roles_gin ON users USING GIN(roles);
+
+-- ============================================================================
+-- CATEGORIES
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS categories (
-    id SERIAL PRIMARY KEY,
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+
     name CITEXT NOT NULL,
-    parent_category_id INTEGER,    
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    descr TEXT,
+    
+    -- Hierarquia
+    parent_id UUID,
+    
+    -- Controle Visual (Essencial para PDV Touch/Bares)
+    color VARCHAR(7) DEFAULT '#FFFFFF', -- Ex: Hex code para o botão na tela
+    icon VARCHAR(50), -- Ex: Nome do ícone (mdi-beer, fa-shirt) ou URL
+    
+    -- Organização e Comportamento
+    sort_order INTEGER DEFAULT 0, -- Para forçar 'Bebidas' a aparecer antes de 'Outros'
+    type category_type_enum NOT NULL DEFAULT 'PRODUCT',
+    is_active BOOLEAN NOT NULL DEFAULT TRUE, -- Para esconder sazonais (ex: Natal) sem deletar
+    is_featured BOOLEAN NOT NULL DEFAULT FALSE, -- Para aparecer na tela inicial/favoritos
+    
+    -- Gastronomia / Setores
+    -- Define onde os itens dessa categoria são impressos (Cozinha, Bar, Copa)
+    remote_printer_name VARCHAR(50), 
+
+    -- Auditoria e Isolamento
     tenant_id UUID NOT NULL,
     created_by UUID,
-    CONSTRAINT categories_name_length_cstr CHECK (length(name) <= 64 AND length(name) >= 3),
-    CONSTRAINT categories_name_unique_cstr UNIQUE (name, tenant_id),
-    FOREIGN KEY (parent_category_id) REFERENCES categories(id) ON DELETE SET NULL ON UPDATE CASCADE,
+
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT categories_name_length_cstr CHECK (length(name) BETWEEN 2 AND 100),
+    -- Garante unicidade do nome DENTRO do mesmo nível hierárquico e tenant
+    -- (Permite ter 'Bebidas' dentro de 'Loja A' e 'Bebidas' dentro de 'Loja B')
+    CONSTRAINT categories_unique_name_tenant_parent UNIQUE (tenant_id, parent_id, name),    
+    CONSTRAINT categories_no_self_parent CHECK (id <> parent_id),    
+    FOREIGN KEY (parent_id) REFERENCES categories(id) ON DELETE SET NULL ON UPDATE CASCADE,
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE ON UPDATE CASCADE,
     FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_categories_parent ON categories(parent_category_id);
-CREATE INDEX IF NOT EXISTS idx_categories_tenant_id ON categories(tenant_id);
 
+CREATE INDEX IF NOT EXISTS idx_categories_tenant_parent ON categories(tenant_id, parent_id);
+CREATE INDEX IF NOT EXISTS idx_categories_display ON categories(tenant_id, sort_order) WHERE is_active = TRUE;
+CREATE INDEX IF NOT EXISTS idx_categories_name_search ON categories USING GIN (name gin_trgm_ops);
+
+
+CREATE OR REPLACE FUNCTION get_category_tree(target_tenant_id UUID)
+RETURNS TABLE (
+    id UUID,
+    name CITEXT,
+    parent_id UUID,
+    level INTEGER,
+    path TEXT
+) AS $$
+BEGIN
+    RETURN QUERY
+    WITH RECURSIVE category_tree AS (
+        -- 1. Âncora: Nível Raiz (Pai é NULL)
+        SELECT 
+            c.id, 
+            c.name, 
+            c.parent_id, 
+            0 AS level, 
+            CAST(c.name AS TEXT) AS path
+        FROM categories c
+        WHERE c.parent_id IS NULL 
+          AND c.tenant_id = target_tenant_id
+        
+        UNION ALL
+        
+        -- 2. Recursão: Busca os filhos
+        SELECT 
+            c.id, 
+            c.name, 
+            c.parent_id, 
+            ct.level + 1,
+            CAST(ct.path || ' > ' || c.name AS TEXT)
+        FROM categories c
+        INNER JOIN category_tree ct ON c.parent_id = ct.id
+        -- Nota: Não precisamos filtrar tenant_id aqui de novo, 
+        -- pois os filhos herdam o contexto do pai pela chave estrangeira.
+    )
+    SELECT 
+        ct.id, 
+        ct.name, 
+        ct.parent_id, 
+        ct.level, 
+        ct.path
+    FROM category_tree ct
+    ORDER BY ct.path;
+END;
+$$ LANGUAGE plpgsql STABLE;
 
 -- ============================================================================
 -- SUPPLIERS - Cadastro de fornecedores de produtos
@@ -173,7 +550,7 @@ CREATE TABLE IF NOT EXISTS suppliers (
 CREATE INDEX IF NOT EXISTS idx_suppliers_tenant_id ON suppliers(tenant_id);
 
 -- ============================================================================
--- TRIBUTAÇÃO - Grupos fiscais e impostos
+-- TRIBUTAÇÃO
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS tax_groups (
@@ -193,194 +570,296 @@ CREATE TABLE IF NOT EXISTS tax_groups (
 CREATE INDEX IF NOT EXISTS idx_tax_groups_tenant_id ON tax_groups(tenant_id);
 
 -- ============================================================================
--- PRODUTOS - Cadastro principal de mercadorias
+-- PRODUCTS
 -- ============================================================================
 
-CREATE TABLE IF NOT EXISTS products (
-    -- Identificação
+CREATE TABLE IF NOT EXISTS products (    
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    sku CITEXT, -- Pode ser nulo para produtos internos/modificadores
     name CITEXT NOT NULL,
-    sku CITEXT NOT NULL,
     description TEXT,
-    category_id INTEGER NOT NULL,
     image_url TEXT,
     
-    -- Fiscal
-    gtin VARCHAR(14),
+    -- Categorização
+    category_id UUID NOT NULL,
+    type product_type_enum NOT NULL DEFAULT 'STANDARD',
+    
+    -- Fiscal (Obrigatórios para NFe/NFCe)
+    gtin VARCHAR(14), -- EAN/Barcode
     ncm VARCHAR(8),
     cest VARCHAR(7),
     cfop_default VARCHAR(4),
     origin CHAR(1) NOT NULL DEFAULT '0',
-    tax_group_id UUID,
+    tax_group_id UUID, -- Grupo tributário (regras de ICMS/PIS/COFINS)
 
-    -- Estoque
-    stock_quantity NUMERIC(10, 3) NOT NULL DEFAULT 0,
-    min_stock_quantity NUMERIC(10, 3) NOT NULL DEFAULT 0,
-    max_stock_quantity NUMERIC(10, 3) NOT NULL DEFAULT 0,
-    average_weight NUMERIC(10, 4) NOT NULL DEFAULT 0.0,
+    -- Estoque e Balança
+    stock_quantity NUMERIC(15, 3) NOT NULL DEFAULT 0,
+    min_stock_quantity NUMERIC(15, 3) DEFAULT 0,
+    max_stock_quantity NUMERIC(15, 3),
     
-    -- Preços e Margem
-    purchase_price NUMERIC(10, 2) NOT NULL DEFAULT 0,
-    sale_price NUMERIC(10, 2) NOT NULL DEFAULT 0,
-    profit_margin NUMERIC(10, 2) GENERATED ALWAYS AS (
-        CASE WHEN purchase_price > 0 
-        THEN ((sale_price - purchase_price) / purchase_price * 100) 
-        ELSE 0 END
-    ) STORED,
     measure_unit measure_unit_enum NOT NULL DEFAULT 'UN',
+    is_weighable BOOLEAN NOT NULL DEFAULT FALSE, -- Se TRUE, exporta para balança (Toledo/Filizola)
+    average_weight NUMERIC(10, 4) DEFAULT 0.0, -- Peso médio (informativo) ou Tara
     
-    -- Status
+    -- Preços e Custos
+    cost_price NUMERIC(15, 2) NOT NULL DEFAULT 0, -- Custo Médio (usado para margem)
+    purchase_price NUMERIC(15, 2) NOT NULL DEFAULT 0, -- Preço da Última Compra (atualização rápida)
+    sale_price NUMERIC(15, 2) NOT NULL DEFAULT 0, -- Preço de Venda Base
+    
+    -- Promoções (Supermercados usam muito)
+    promo_price NUMERIC(15, 2), -- Preço promocional
+    promo_start_at TIMESTAMP,
+    promo_end_at TIMESTAMP,
+
+    -- Margem Calculada (Baseada no Custo Médio e Preço de Venda ATUAL)
+    -- Se houver promoção ativa no momento do SELECT, o cálculo deve ser feito na aplicação, 
+    -- aqui calculamos a margem "Cheia".
+    profit_margin NUMERIC(10, 2) GENERATED ALWAYS AS (
+        CASE WHEN cost_price > 0 
+        THEN ((sale_price - cost_price) / cost_price * 100) 
+        ELSE 100 END
+    ) STORED,
+
+    -- Gastronomia / Bares
+    needs_preparation BOOLEAN NOT NULL DEFAULT FALSE, -- Se TRUE, envia para KDS/Cozinha
+    preparation_time INTEGER, -- Tempo estimado em minutos (para gestão de fila)
+    remote_printer_name VARCHAR(50), -- Sobrescreve a impressora da Categoria (ex: Bebida na Copa, Petisco na Cozinha)
+    
+    -- Status e Controle
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    needs_preparation BOOLEAN NOT NULL DEFAULT FALSE,
+    is_blocked_on_negative_stock BOOLEAN NOT NULL DEFAULT FALSE, -- Impede venda se estoque zerar
 
-    tenant_id UUID NOT NULL,
-    created_by UUID,
-
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-
-    FOREIGN KEY (category_id) REFERENCES categories(id) ON UPDATE CASCADE,
-    FOREIGN KEY (tax_group_id) REFERENCES tax_groups(id) ON DELETE SET NULL ON UPDATE CASCADE,
-    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE ON UPDATE CASCADE,
-    FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE,
-    CONSTRAINT products_name_unique_cstr UNIQUE (name, tenant_id),
-    CONSTRAINT products_gtin_unique_cstr UNIQUE (gtin, tenant_id),
-    CONSTRAINT products_unique_sku_cstr UNIQUE (sku, tenant_id),
-    CONSTRAINT products_sku_chk CHECK ((length(sku) >= 2 AND length(sku) <= 128))
-);
-
-CREATE INDEX IF NOT EXISTS idx_products_tenant_category_active ON products(tenant_id, category_id, is_active) WHERE is_active = TRUE;
-CREATE INDEX IF NOT EXISTS idx_products_name ON products USING gin(name gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_products_tenant_active ON products(tenant_id, is_active);
-CREATE INDEX IF NOT EXISTS idx_products_tenant_sku ON products(tenant_id, sku);
-CREATE INDEX IF NOT EXISTS idx_products_tenant_gtin ON products(tenant_id, gtin);
-CREATE INDEX IF NOT EXISTS idx_products_tenant_category ON products(tenant_id, category_id);
-CREATE INDEX IF NOT EXISTS idx_products_low_stock ON products(stock_quantity, min_stock_quantity) WHERE stock_quantity <= min_stock_quantity AND is_active = TRUE;
-
--- ============================================================================
--- RECEITAS - Composição de produtos preparados
--- ============================================================================
-
-CREATE TABLE IF NOT EXISTS recipes (
-    product_id UUID NOT NULL,
-    ingredient_id UUID NOT NULL,
-    quantity NUMERIC(10, 4) NOT NULL,
-    PRIMARY KEY (product_id, ingredient_id),
-    FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE,
-    FOREIGN KEY (ingredient_id) REFERENCES products(id) ON DELETE CASCADE,
-    CONSTRAINT recipes_quantity_valid CHECK (quantity > 0.0000)
-);
-
-COMMENT ON TABLE recipes IS 'Receitas de produtos preparados (ex: caipirinha = limão + cachaça + açúcar)';
-COMMENT ON COLUMN recipes.product_id IS 'Produto final que será preparado';
-COMMENT ON COLUMN recipes.ingredient_id IS 'Ingrediente necessário (também deve ser um produto cadastrado)';
-COMMENT ON COLUMN recipes.quantity IS 'Quantidade do ingrediente necessária por unidade do produto final';
-
--- ============================================================================
--- LOTES - Controle de validade e rastreabilidade
--- ============================================================================
-
-CREATE TABLE IF NOT EXISTS batches (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    product_id UUID NOT NULL,
-    batch_code TEXT,
-    expiration_date DATE NOT NULL,
-    quantity NUMERIC(10, 3) NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    tenant_id UUID NOT NULL,
-    created_by UUID,
-    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE ON UPDATE CASCADE,
-    FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE,
-    FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE,
-    CONSTRAINT batches_batch_code_length_cstr CHECK (length(batch_code) <= 64),
-    CONSTRAINT batches_quantity_valid CHECK (quantity >= 0.000)
-);
-
-CREATE INDEX IF NOT EXISTS idx_batches_product ON batches(product_id);
-CREATE INDEX IF NOT EXISTS idx_batches_expiration ON batches(expiration_date);
-
--- ============================================================================
--- USUÁRIOS - Cadastro de funcionários e clientes
--- ============================================================================
-
-CREATE TABLE IF NOT EXISTS users (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    name TEXT NOT NULL,
-    nickname TEXT,
-    email TEXT,
-    phone TEXT,
-    cpf VARCHAR(14),
-    notes TEXT,
-    password_hash TEXT,
-
-    -- Controle de crédito para vendas fiadas
-    credit_limit NUMERIC(10, 2) NOT NULL DEFAULT 0,
-    invoice_amount NUMERIC(10, 2) NOT NULL DEFAULT 0,
-
-    state_tax_indicator SMALLINT DEFAULT 9,
-
-    last_login_at TIMESTAMP,
-    failed_login_attempts INTEGER DEFAULT 0,
-    account_locked_until TIMESTAMP,
+    -- Busca textual
+    search_vector tsvector GENERATED ALWAYS AS (
+        setweight(to_tsvector('portuguese', COALESCE(name, '')), 'A') ||
+        setweight(to_tsvector('portuguese', COALESCE(description, '')), 'B') ||
+        setweight(to_tsvector('portuguese', COALESCE(sku, '')), 'C')
+    ) STORED,
 
     -- Auditoria
     tenant_id UUID NOT NULL,
     created_by UUID,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-
+    -- Relacionamentos
+    FOREIGN KEY (category_id) REFERENCES categories(id) ON UPDATE CASCADE,
+    FOREIGN KEY (tax_group_id) REFERENCES tax_groups(id) ON DELETE SET NULL ON UPDATE CASCADE,
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE ON UPDATE CASCADE,
     FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE,
-    CONSTRAINT users_email_unique_cstr UNIQUE (email, tenant_id),
-    CONSTRAINT users_cpf_unique_cstr UNIQUE (cpf, tenant_id),
-    CONSTRAINT users_valid_cpf_cstr
-        CHECK (
-            cpf IS NULL
-            OR cpf ~ '^\d{3}\.\d{3}\.\d{3}-\d{2}$'
-            OR cpf ~ '^\d{11}$'
-    ),
-    CONSTRAINT users_valid_phone_cstr
-        CHECK (
-            phone IS NULL
-            OR phone ~ '^\d{10,11}$'
-            OR phone ~ '^\(\d{2}\)\s?\d{4,5}-?\d{4}$'
-    ),
-    CONSTRAINT users_name_length_cstr CHECK (length(name) BETWEEN 2 AND 256),
-    CONSTRAINT users_nickname_length_cstr CHECK (nickname IS NULL OR (length(nickname) BETWEEN 2 AND 256)),
-    CONSTRAINT users_notes_length_cstr CHECK (notes IS NULL OR (length(notes) BETWEEN 2 AND 256))
+
+    -- Constraints
+    CONSTRAINT products_sku_unique_cstr UNIQUE (sku, tenant_id),
+    CONSTRAINT products_gtin_unique_cstr UNIQUE (gtin, tenant_id),
+    CONSTRAINT products_sku_length_chk CHECK (sku IS NULL OR length(sku) BETWEEN 2 AND 128),
+    CONSTRAINT products_promo_date_chk CHECK (promo_end_at > promo_start_at),
+    CONSTRAINT products_promo_price_chk CHECK (promo_price IS NULL OR promo_price < sale_price)
 );
 
-COMMENT ON TABLE users IS 'Cadastro de usuários do sistema (funcionários e clientes)';
-COMMENT ON COLUMN users.password_hash IS 'Hash da senha (apenas para funcionários que acessam o sistema)';
-COMMENT ON COLUMN users.credit_limit IS 'Limite de crédito para compras fiadas';
-COMMENT ON COLUMN users.invoice_amount IS 'Valor total em aberto (dívidas não pagas)';
-COMMENT ON COLUMN users.state_tax_indicator IS 'Indicador fiscal: 1=Contribuinte ICMS, 2=Isento, 9=Não Contribuinte';
-COMMENT ON COLUMN users.notes IS 'Observações sobre o usuário (ex: "Sempre paga em dia", "Preferência por cerveja X")';
+CREATE INDEX IF NOT EXISTS idx_products_search_name ON products USING gin(name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_products_search_sku ON products USING btree(sku) WHERE sku IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_products_pos_list ON products(tenant_id, category_id, name) WHERE is_active = TRUE;
+CREATE INDEX IF NOT EXISTS idx_products_gtin ON products(tenant_id, gtin) WHERE gtin IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_products_low_stock ON products(tenant_id) WHERE stock_quantity <= min_stock_quantity AND is_active = TRUE AND type = 'STANDARD';
+CREATE INDEX IF NOT EXISTS idx_products_active_stock ON products(tenant_id, is_active, stock_quantity) WHERE type = 'STANDARD';
+CREATE INDEX IF NOT EXISTS idx_products_search ON products USING GIN(search_vector);
+CREATE INDEX IF NOT EXISTS idx_products_fts ON products USING GIN(to_tsvector('portuguese', name || ' ' || description));
+CREATE INDEX IF NOT EXISTS idx_products_negative_stock ON products(tenant_id, stock_quantity) WHERE stock_quantity < 0;
 
-CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
-CREATE INDEX IF NOT EXISTS idx_users_cpf ON users(cpf);
-CREATE INDEX IF NOT EXISTS idx_users_name ON users USING gin(name gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_users_tenant_id ON users(tenant_id);
-CREATE INDEX IF NOT EXISTS idx_users_tenant_cpf ON users(tenant_id, cpf) WHERE cpf IS NOT NULL;
+-- MELHORAR TRIGGER DE AUDITORIA DE PREÇOS:
+CREATE OR REPLACE FUNCTION fn_audit_price_changes()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'UPDATE' AND (
+        OLD.sale_price != NEW.sale_price OR
+        OLD.cost_price != NEW.cost_price OR
+        OLD.promo_price != NEW.promo_price
+    ) THEN
+        INSERT INTO price_audits (
+            product_id,
+            old_purchase_price,
+            new_purchase_price,
+            old_sale_price,
+            new_sale_price,
+            changed_by,
+            changed_at
+        ) VALUES (
+            NEW.id,
+            OLD.cost_price,
+            NEW.cost_price,
+            OLD.sale_price,
+            NEW.sale_price,
+            COALESCE(current_user_id(), NEW.created_by),
+            NOW()
+        );
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
 
+-- Aplicar trigger se não existir
+CREATE OR REPLACE TRIGGER trg_products_price_audit
+AFTER UPDATE ON products
+FOR EACH ROW EXECUTE FUNCTION fn_audit_price_changes();
+
+
+CREATE OR REPLACE FUNCTION search_products(search_query TEXT)
+RETURNS TABLE (
+    id UUID,
+    name CITEXT,
+    sku CITEXT,
+    category_name CITEXT,
+    stock_quantity NUMERIC,
+    sale_price NUMERIC,
+    relevance NUMERIC
+) AS $$
+DECLARE
+    v_tenant_id UUID;
+BEGIN
+    -- Obter tenant_id das configurações da sessão
+    v_tenant_id := current_user_tenant_id();
+    
+    -- Validar se o tenant_id está configurado
+    IF v_tenant_id IS NULL THEN
+        RAISE EXCEPTION 'Tenant ID não configurado na sessão. Use set_config(''app.current_tenant_id'', ''tenant_uuid'')';
+    END IF;
+    
+    -- Converter search_query para segurança (evitar injeção)
+    search_query := trim(search_query);
+    
+    -- Validar query não vazia
+    IF length(search_query) < 2 THEN
+        RAISE EXCEPTION 'Query de busca deve ter pelo menos 2 caracteres';
+    END IF;
+    
+    RETURN QUERY
+    SELECT 
+        p.id,
+        p.name,
+        p.sku,
+        c.name as category_name,
+        p.stock_quantity,
+        COALESCE(
+            CASE 
+                WHEN p.promo_price IS NOT NULL 
+                    AND p.promo_start_at <= NOW() 
+                    AND p.promo_end_at >= NOW()
+                THEN p.promo_price
+                ELSE p.sale_price
+            END,
+            p.sale_price
+        ) as sale_price,
+        ts_rank(p.search_vector, plainto_tsquery('portuguese', search_query)) as relevance
+    FROM products p
+    JOIN categories c ON p.category_id = c.id
+    WHERE p.tenant_id = v_tenant_id
+      AND p.is_active = true
+      AND (
+        -- Busca full-text
+        p.search_vector @@ plainto_tsquery('portuguese', search_query)
+        -- Fallback para buscas por SKU exato
+        OR (p.sku IS NOT NULL AND p.sku ILIKE '%' || search_query || '%')
+        -- Fallback para busca por nome (para queries muito curtas)
+        OR (length(search_query) <= 3 AND p.name ILIKE '%' || search_query || '%')
+      )
+    ORDER BY 
+        -- Priorizar resultados exatos de SKU
+        CASE WHEN p.sku ILIKE search_query THEN 0 ELSE 1 END,
+        relevance DESC, 
+        p.name
+    LIMIT 100;
+EXCEPTION
+    WHEN OTHERS THEN
+        -- Log do erro (opcional)
+        RAISE NOTICE 'Erro na busca de produtos: %', SQLERRM;
+        -- Retornar vazio em caso de erro
+        RETURN;
+END;
+$$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
 
 -- ============================================================================
--- USER_ROLES - Função de cada funcionáio/membro de um tenant
+-- PRODUCT COMPOSITIONS - Composição de produtos compostos
 -- ============================================================================
 
-CREATE TABLE IF NOT EXISTS user_roles (
-    id UUID NOT NULL,
-    role user_role_enum NOT NULL DEFAULT 'CLIENTE',
+CREATE TABLE IF NOT EXISTS product_compositions (
+    parent_product_id UUID NOT NULL, -- O Produto do tipo 'COMBO'
+    child_product_id UUID NOT NULL,  -- O Produto do tipo 'STANDARD'
+    quantity NUMERIC(10, 3) NOT NULL, -- Quanto baixa do filho
     tenant_id UUID NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (id, role),
-    FOREIGN KEY (id) REFERENCES users(id) ON DELETE CASCADE,
-    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE ON UPDATE CASCADE
+    PRIMARY KEY (parent_product_id, child_product_id),
+    FOREIGN KEY (parent_product_id) REFERENCES products(id) ON DELETE CASCADE,
+    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE ON UPDATE CASCADE,
+    FOREIGN KEY (child_product_id) REFERENCES products(id) ON DELETE RESTRICT
 );
 
-CREATE INDEX IF NOT EXISTS idx_user_roles_tenant_role ON user_roles (tenant_id, role);
-CREATE INDEX IF NOT EXISTS idx_user_roles_user_id ON user_roles(id);
+CREATE INDEX IF NOT EXISTS idx_compositions_tenant_parent ON product_compositions(tenant_id, parent_product_id);
+
+-- ============================================================================
+-- PRODUCT MOFIFIER GROUPS
+-- ============================================================================
+
+-- Ex: Grupo "Pontos da Carne", Min: 1, Max: 1 (Obrigatório escolher 1)
+-- Ex: Grupo "Adicionais", Min: 0, Max: 5 (Opcional)
+CREATE TABLE IF NOT EXISTS product_modifier_groups (
+    product_id UUID NOT NULL, -- O Hamburger
+    category_id UUID NOT NULL, -- A Categoria que contém os modificadores (ex: categoria 'Adicionais')
+    tenant_id UUID NOT NULL,
+
+    min_selection INTEGER DEFAULT 0,
+    max_selection INTEGER DEFAULT 1,
+    free_selection INTEGER DEFAULT 0, -- Quantos itens são grátis antes de cobrar
+    
+    PRIMARY KEY (product_id, category_id),
+    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE ON UPDATE CASCADE,
+    FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE,
+    FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE CASCADE
+);
+
+
+-- ============================================================================
+-- LOTES
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS batches (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    -- Identificação
+    product_id UUID NOT NULL,
+    batch_code TEXT NOT NULL, -- Código impresso na embalagem
+    
+    -- Datas Críticas
+    manufacturing_date DATE,
+    expiration_date DATE NOT NULL,
+    
+    -- Quantidades e Custos (Essencial para Lucro Real e FIFO)
+    initial_quantity NUMERIC(15, 3) NOT NULL, -- Quanto entrou originalmente
+    current_quantity NUMERIC(15, 3) NOT NULL, -- Quanto tem agora
+    unit_cost NUMERIC(15, 2) NOT NULL DEFAULT 0, -- Custo unitário DESTE lote específico
+
+    -- Controle
+    is_blocked BOOLEAN DEFAULT FALSE, -- Para Recall ou Quarentena
+    block_reason TEXT,
+
+    -- Auditoria
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    tenant_id UUID NOT NULL,
+    created_by UUID,
+
+    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE ON UPDATE CASCADE,
+    FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE,
+    FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE,
+    
+    -- Validações
+    CONSTRAINT batches_batch_code_length_cstr CHECK (length(batch_code) <= 64),
+    CONSTRAINT batches_quantity_valid CHECK (current_quantity >= 0),
+    CONSTRAINT batches_dates_check CHECK (expiration_date >= manufacturing_date),
+    
+    -- Um produto não pode ter dois lotes com mesmo código no mesmo tenant
+    CONSTRAINT batches_unique_code_tenant UNIQUE (tenant_id, product_id, batch_code)
+);
+
+CREATE INDEX IF NOT EXISTS idx_batches_fifo ON batches(product_id, expiration_date ASC) WHERE current_quantity > 0 AND is_blocked = FALSE;
+
 
 -- ============================================================================
 -- ENDEREÇOS - Endereços de usuários/clientes
@@ -417,7 +896,7 @@ CREATE TABLE IF NOT EXISTS user_addresses (
 );
 
 -- ============================================================================
--- TOKENS DE SESSÃO - Controle de autenticação
+-- TOKENS DE SESSÃO
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS refresh_tokens (
@@ -438,9 +917,10 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
 CREATE INDEX IF NOT EXISTS idx_refresh_token_family ON refresh_tokens(family_id);
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_active_family ON refresh_tokens(family_id) WHERE revoked = FALSE;
 CREATE INDEX IF NOT EXISTS idx_refresh_token_hash ON refresh_tokens(token_hash);
+CREATE INDEX IF NOT EXISTS idx_refresh_tokens_cleanup ON refresh_tokens (created_at) WHERE revoked = false AND expires_at < NOW() - INTERVAL '30 days';
 
 -- ============================================================================
--- AUDITORIA DE PREÇOS - Histórico de alterações de preços
+-- PRICE AUDITS - Histórico de alterações de preços
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS price_audits (
@@ -450,9 +930,11 @@ CREATE TABLE IF NOT EXISTS price_audits (
     new_purchase_price NUMERIC(10, 2),
     old_sale_price NUMERIC(10, 2),
     new_sale_price NUMERIC(10, 2),
+    tenant_id UUID NOT NULL,
     changed_by UUID,
     changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (product_id) REFERENCES products(id),
+    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE ON UPDATE CASCADE,
     FOREIGN KEY (changed_by) REFERENCES users(id),
     FOREIGN KEY (changed_by) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE
 );
@@ -461,89 +943,169 @@ CREATE INDEX IF NOT EXISTS idx_price_audits_product ON price_audits(product_id);
 CREATE INDEX IF NOT EXISTS idx_price_audits_changed_at ON price_audits(changed_at DESC);
 
 -- ============================================================================
--- MOVIMENTAÇÃO DE ESTOQUE - Todas as entradas e saídas
+-- STOCK MOVEMENTS - Todas as entradas e saídas
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS stock_movements (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    product_id UUID NOT NULL,
-    type stock_movement_enum NOT NULL,
-    quantity NUMERIC(10, 3) NOT NULL,
-    reference_id UUID,
-    reason TEXT,
-    created_by UUID,
+    
+    -- O Que e Onde
     tenant_id UUID NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    product_id UUID NOT NULL,
+    batch_id UUID, -- Opcional (nem todo produto tem controle de lote)
+    
+    -- O Movimento
+    type stock_movement_enum NOT NULL,
+    quantity NUMERIC(15, 3) NOT NULL CHECK (quantity > 0), -- Sempre positivo, o tipo define o sinal
+    
+    -- Valores (Snapshot financeiro)
+    unit_cost NUMERIC(15, 2) DEFAULT 0, -- Custo no momento da operação
+    total_cost NUMERIC(15, 2) GENERATED ALWAYS AS (quantity * unit_cost) STORED,
+
+    -- Rastreabilidade
+    reference_id UUID, -- ID da Venda, ID da Compra, ID da Perda
+    reason TEXT, -- "Garrafa quebrada pelo cliente", "Venda #123"
+    
+    -- Auditoria
+    created_by UUID,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,    
+    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE ON UPDATE CASCADE,
     FOREIGN KEY (product_id) REFERENCES products(id) ON UPDATE CASCADE,
-    FOREIGN KEY (created_by) REFERENCES users(id) ON UPDATE CASCADE ON DELETE SET NULL,
-    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE ON UPDATE CASCADE
+    FOREIGN KEY (batch_id) REFERENCES batches(id) ON UPDATE CASCADE, -- Se deletar o lote, mantemos o histórico (set null ou restrict seria melhor, mas cascade é prático)
+    FOREIGN KEY (created_by) REFERENCES users(id) ON UPDATE CASCADE ON DELETE SET NULL
 );
 
-COMMENT ON TABLE stock_movements IS 'Registro de todas as movimentações de estoque (entradas e saídas)';
-COMMENT ON COLUMN stock_movements.type IS 'Tipo: VENDA, COMPRA, DEVOLUCAO, PERDA, AJUSTE, etc';
-COMMENT ON COLUMN stock_movements.quantity IS 'Quantidade movimentada (positivo=entrada, negativo=saída)';
-COMMENT ON COLUMN stock_movements.reference_id IS 'ID da venda/compra relacionada (se aplicável)';
-COMMENT ON COLUMN stock_movements.reason IS 'Motivo da movimentação (ex: "Venda #123", "Produto vencido")';
+CREATE INDEX IF NOT EXISTS idx_stock_mv_tenant_prod_date ON stock_movements(tenant_id, product_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_stock_mv_ref ON stock_movements(tenant_id, reference_id);
+CREATE INDEX IF NOT EXISTS idx_stock_mv_batch ON stock_movements(batch_id) WHERE batch_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_stock_mv_report ON stock_movements(tenant_id, product_id, type, created_at DESC);
 
-CREATE INDEX IF NOT EXISTS idx_stock_movements_product ON stock_movements(product_id);
-CREATE INDEX IF NOT EXISTS idx_stock_movements_type ON stock_movements(type);
-CREATE INDEX IF NOT EXISTS idx_stock_movements_created ON stock_movements(created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_stock_movements_reference ON stock_movements(reference_id);
-CREATE INDEX IF NOT EXISTS idx_stock_movements_tenant_created ON stock_movements(tenant_id, created_at DESC, type);
 
 ALTER TABLE stock_movements SET (
     autovacuum_vacuum_scale_factor = 0.05,
     autovacuum_analyze_scale_factor = 0.02
 );
 
+
+CREATE OR REPLACE FUNCTION fn_update_stock_balance()
+RETURNS TRIGGER AS $$
+DECLARE
+    movement_multiplier INTEGER;
+BEGIN
+    -- 1. Define se a operação Soma (1) ou Subtrai (-1)
+    CASE NEW.type
+        -- Entradas
+        WHEN 'COMPRA' THEN movement_multiplier := 1;
+        WHEN 'BONIFICACAO' THEN movement_multiplier := 1;
+        WHEN 'DEVOLUCAO_CLIENTE' THEN movement_multiplier := 1;
+        WHEN 'AJUSTE_ENTRADA' THEN movement_multiplier := 1;
+        WHEN 'PRODUCAO_ENTRADA' THEN movement_multiplier := 1;
+        WHEN 'TRANSFERENCIA_ENTRADA' THEN movement_multiplier := 1;
+        WHEN 'INVENTARIO_INICIAL' THEN movement_multiplier := 1;
+        WHEN 'CANCELAMENTO' THEN movement_multiplier := 1;
+        
+        -- Saídas
+        WHEN 'VENDA' THEN movement_multiplier := -1;
+        WHEN 'DEVOLUCAO_FORNECEDOR' THEN movement_multiplier := -1;
+        WHEN 'PERDA' THEN movement_multiplier := -1;
+        WHEN 'QUEBRA' THEN movement_multiplier := -1;
+        WHEN 'VENCIMENTO' THEN movement_multiplier := -1;
+        WHEN 'FURTO' THEN movement_multiplier := -1;
+        WHEN 'AVARIA' THEN movement_multiplier := -1;
+        WHEN 'CONSUMO_INTERNO' THEN movement_multiplier := -1;
+        WHEN 'AJUSTE_SAIDA' THEN movement_multiplier := -1;
+        WHEN 'PRODUCAO_SAIDA' THEN movement_multiplier := -1;
+        WHEN 'TRANSFERENCIA_SAIDA' THEN movement_multiplier := -1;
+        
+        -- Neutros (Ou tipos futuros)
+        ELSE movement_multiplier := 0;
+    END CASE;
+
+    -- Se o multiplicador for 0, não faz nada
+    IF movement_multiplier = 0 THEN
+        RETURN NEW;
+    END IF;
+
+    -- 2. Atualiza o Estoque Geral do Produto
+    UPDATE products
+    SET 
+        stock_quantity = stock_quantity + (NEW.quantity * movement_multiplier),
+        updated_at = NOW() -- Atualiza timestamp para sincronia
+    WHERE id = NEW.product_id;
+
+    -- 3. Se houver Lote vinculado, atualiza o saldo do Lote
+    IF NEW.batch_id IS NOT NULL THEN
+        UPDATE batches
+        SET 
+            current_quantity = current_quantity + (NEW.quantity * movement_multiplier),
+            updated_at = NOW()
+        WHERE id = NEW.batch_id;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE TRIGGER trg_stock_movements_balance
+AFTER INSERT ON stock_movements
+FOR EACH ROW
+EXECUTE FUNCTION fn_update_stock_balance();
+
 -- ============================================================================
--- VENDAS - Cabeçalho das vendas
+-- SALES
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS sales (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    
+    -- Totais
     subtotal NUMERIC(10, 2) NOT NULL DEFAULT 0,
     total_discount NUMERIC(10, 2) DEFAULT 0,
-    total_amount NUMERIC(10, 2) NOT NULL DEFAULT 0,
+    shipping_fee NUMERIC(10, 2) DEFAULT 0, -- Taxa de entrega (Delivery)
+    total_amount NUMERIC(10, 2) NOT NULL DEFAULT 0, -- (Subtotal - Desc + Frete)
+    
     status sale_status_enum DEFAULT 'ABERTA',
 
-    salesperson_id UUID,
-    customer_id UUID,
+    -- Atores
+    salesperson_id UUID, -- Quem vendeu (Comissão)
+    customer_id UUID,    -- Quem comprou (CRM/Fiado)
     
+    -- Gastronomia / Bares
+    table_number INTEGER,   -- Número da Mesa
+    command_number INTEGER, -- Número da Comanda/Ficha
+    waiter_id UUID,         -- Garçom (diferente do caixa que fecha a conta)
+
+    -- Dados Fiscais (Snapshot da Nota Fiscal)
+    fiscal_key VARCHAR(44),     -- Chave de acesso da NFe/NFCe
+    fiscal_number INTEGER,      -- Número da nota
+    fiscal_series INTEGER,      -- Série
+    fiscal_model VARCHAR(2),    -- '65' (NFCe) ou '59' (SAT)
+    
+    -- Cancelamento
     cancelled_by UUID,
     cancelled_at TIMESTAMP,
     cancellation_reason TEXT,
 
-    -- Auditoria
+    -- Auditoria e Isolamento
     tenant_id UUID NOT NULL,
-    created_by UUID,
-
+    created_by UUID, -- Quem abriu a venda (geralmente o Caixa)
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     finished_at TIMESTAMP,
+
+    CONSTRAINT sales_fiscal_key_unique UNIQUE (tenant_id, fiscal_key) WHERE fiscal_key IS NOT NULL,
+
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE ON UPDATE CASCADE,
-    FOREIGN KEY (salesperson_id) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE,
-    FOREIGN KEY (customer_id) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE,
-    FOREIGN KEY (cancelled_by) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE,
-    FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE
+    FOREIGN KEY (salesperson_id) REFERENCES users(id) ON DELETE SET NULL,
+    FOREIGN KEY (waiter_id) REFERENCES users(id) ON DELETE SET NULL,
+    FOREIGN KEY (customer_id) REFERENCES users(id) ON DELETE SET NULL,
+    FOREIGN KEY (cancelled_by) REFERENCES users(id) ON DELETE SET NULL,
+    FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
 );
 
-COMMENT ON TABLE sales IS 'Cabeçalho das vendas realizadas';
-COMMENT ON COLUMN sales.subtotal IS 'Soma dos itens antes de descontos';
-COMMENT ON COLUMN sales.total_discount IS 'Desconto total aplicado na venda';
-COMMENT ON COLUMN sales.total_amount IS 'Valor final da venda (subtotal - desconto)';
-COMMENT ON COLUMN sales.status IS 'Status: ABERTA, CONCLUIDA, CANCELADA, EM_ENTREGA';
-COMMENT ON COLUMN sales.salesperson_id IS 'Funcionário que realizou a venda';
-COMMENT ON COLUMN sales.customer_id IS 'Cliente que realizou a compra (opcional)';
-COMMENT ON COLUMN sales.finished_at IS 'Data/hora da conclusão da venda';
-
-CREATE INDEX IF NOT EXISTS idx_sales_status ON sales(status);
-CREATE INDEX IF NOT EXISTS idx_sales_customer ON sales(customer_id);
-CREATE INDEX IF NOT EXISTS idx_sales_salesperson ON sales(salesperson_id);
-CREATE INDEX IF NOT EXISTS idx_sales_created_at ON sales(created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_sales_finished_at ON sales(finished_at DESC) WHERE finished_at IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_sales_tenant_id ON sales(tenant_id);
-CREATE INDEX IF NOT EXISTS idx_sales_tenant_status ON sales(tenant_id, status);
-CREATE INDEX IF NOT EXISTS idx_sales_tenant_status_created ON sales(tenant_id, status, created_at DESC) WHERE status = 'ABERTA';
+CREATE INDEX IF NOT EXISTS idx_sales_tenant_status_created ON sales(tenant_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sales_fiscal ON sales(tenant_id, fiscal_number, fiscal_series);
+CREATE INDEX IF NOT EXISTS idx_sales_command ON sales(tenant_id, command_number) WHERE status = 'ABERTA';
+CREATE INDEX IF NOT EXISTS idx_sales_dashboard ON sales(tenant_id, status, created_at DESC) INCLUDE (total_amount, salesperson_id);
 
 ALTER TABLE sales SET (
     autovacuum_vacuum_scale_factor = 0.05
@@ -553,41 +1115,55 @@ ALTER TABLE sales SET (
 CREATE OR REPLACE FUNCTION fn_handle_sale_cancellation()
 RETURNS TRIGGER AS $$
 BEGIN
-    IF NEW.status = 'CANCELADA' AND OLD.status != 'CANCELADA' THEN
-        -- Reverte estoque de todos os itens
-        INSERT INTO stock_movements (product_id, type, quantity, reference_id, reason, created_by, tenant_id)
+    -- Só age se mudou de QUALQUER status para 'CANCELADA'
+    IF NEW.status = 'CANCELADA' AND OLD.status != 'CANCELADA' THEN        
+        -- 1. Gera movimentação de estoque (Devolução)
+        -- A trigger da tabela 'stock_movements' vai capturar isso e 
+        -- atualizar o 'stock_quantity' em 'products' e 'batches' automaticamente.
+        INSERT INTO stock_movements (
+            tenant_id,
+            product_id,
+            batch_id, -- Importante devolver pro lote certo!
+            type,
+            quantity,
+            reference_id,
+            reason,
+            created_by
+        )
         SELECT 
+            NEW.tenant_id,
             si.product_id,
+            si.batch_id,
             'CANCELAMENTO'::stock_movement_enum,
-            si.quantity, -- Quantidade POSITIVA para devolver ao estoque
+            si.quantity, -- Positivo, pois a trigger de movimento sabe lidar com o tipo CANCELAMENTO
             NEW.id,
-            'Cancelamento de venda #' || NEW.id,
-            NEW.cancelled_by,
-            NEW.tenant_id
+            'Cancelamento da Venda #' || NEW.fiscal_number,
+            NEW.cancelled_by
         FROM sale_items si
         WHERE si.sale_id = NEW.id;
         
-        -- Atualiza estoque dos produtos
-        UPDATE products p
-        SET stock_quantity = stock_quantity + si.quantity
-        FROM sale_items si
-        WHERE si.sale_id = NEW.id 
-        AND p.id = si.product_id;
-        
-        -- Reverte dívida do cliente se foi fiado
-        IF NEW.customer_id IS NOT NULL THEN
-            PERFORM calculate_user_debt_balance(NEW.customer_id);
+        -- 2. Estorno Financeiro (Fiado)
+        -- Se a venda foi no fiado, precisamos estornar o saldo do cliente.
+        -- Verifique se existe pagamento do tipo CREDIARIO nesta venda
+        IF EXISTS (
+            SELECT 1 FROM sale_payments sp 
+            WHERE sp.sale_id = NEW.id AND sp.method = 'CREDIARIO'
+        ) THEN
+            -- Aqui você chamaria sua função de recalcular saldo ou inserir estorno no contas a receber
+            -- PERFORM fn_reverse_accounts_receivable(NEW.id);
+            NULL; -- Placeholder
         END IF;
+
     END IF;
     
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
-
 CREATE OR REPLACE TRIGGER trg_handle_sale_cancellation
 AFTER UPDATE OF status ON sales
 FOR EACH ROW EXECUTE FUNCTION fn_handle_sale_cancellation();
+
 
 -- ============================================================================
 -- ITENS DE VENDA - Produtos vendidos em cada venda
@@ -595,155 +1171,97 @@ FOR EACH ROW EXECUTE FUNCTION fn_handle_sale_cancellation();
 
 CREATE TABLE IF NOT EXISTS sale_items (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    tenant_id UUID NOT NULL, -- Desnormalização para RLS rápido
+    
     sale_id UUID NOT NULL,
     product_id UUID NOT NULL,
-    quantity NUMERIC(10, 3) NOT NULL,
-    unit_sale_price NUMERIC(10, 2) NOT NULL,
-    unit_cost_price NUMERIC(10, 2),
-    subtotal NUMERIC(10, 2) GENERATED ALWAYS AS (quantity * unit_sale_price) STORED,
-    CONSTRAINT sale_items_greater_than_zero_cstr CHECK (quantity > 0),
-    FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE ON UPDATE CASCADE,
-    FOREIGN KEY (sale_id) REFERENCES sales(id) ON DELETE CASCADE ON UPDATE CASCADE
+    batch_id UUID, -- De qual lote saiu esse produto? (Importante p/ validade)
+    
+    -- Quantidades e Preços
+    quantity NUMERIC(10, 3) NOT NULL CHECK (quantity > 0),
+    unit_sale_price NUMERIC(10, 2) NOT NULL, -- Preço unitário NA HORA da venda
+    unit_cost_price NUMERIC(10, 2), -- Custo NA HORA da venda (p/ relatório de margem)
+    
+    discount_amount NUMERIC(10, 2) DEFAULT 0, -- Desconto específico neste item
+    subtotal NUMERIC(10, 2) GENERATED ALWAYS AS ((quantity * unit_sale_price) - discount_amount) STORED,
+
+    -- Snapshot Fiscal (Lei da Transparência / SPED)
+    cfop VARCHAR(4),
+    ncm VARCHAR(8),
+    tax_snapshot JSONB, -- Guarda ICMS, PIS, COFINS calculados no momento
+    notes TEXT, -- "Sem cebola", "Bem passado"
+
+    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
+    FOREIGN KEY (product_id) REFERENCES products(id),
+    FOREIGN KEY (batch_id) REFERENCES batches(id),
+    FOREIGN KEY (sale_id) REFERENCES sales(id) ON DELETE CASCADE
 );
 
-COMMENT ON TABLE sale_items IS 'Itens individuais de cada venda';
-COMMENT ON COLUMN sale_items.unit_sale_price IS 'Preço de venda unitário no momento da venda (congelado)';
-COMMENT ON COLUMN sale_items.unit_cost_price IS 'Custo unitário no momento da venda (para cálculo de lucro real)';
-COMMENT ON COLUMN sale_items.subtotal IS 'Valor total do item (quantidade × preço unitário)';
-
 CREATE INDEX IF NOT EXISTS idx_sale_items_sale ON sale_items(sale_id);
-CREATE INDEX IF NOT EXISTS idx_sale_items_product ON sale_items(product_id);
+CREATE INDEX IF NOT EXISTS idx_sales_customer_lookup ON sales(id, customer_id, status);
+CREATE INDEX IF NOT EXISTS idx_sales_tenant_created_finished ON sales(tenant_id, created_at, finished_at) WHERE status = 'CONCLUIDA';
 
 -- ============================================================================
--- PAGAMENTOS DE VENDAS - Formas de pagamento utilizadas
+-- PAGAMENTOS DE VENDAS 
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS sale_payments (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     sale_id UUID NOT NULL,
+    tenant_id UUID NOT NULL, -- RLS
+    
     method payment_method_enum NOT NULL,
-    total NUMERIC(10, 2) NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (sale_id) REFERENCES sales(id) ON DELETE CASCADE ON UPDATE CASCADE
-);
+    amount NUMERIC(10, 2) NOT NULL, -- Valor efetivo pago (sem troco)
+    
+    -- Detalhes para Conciliação de Caixa
+    amount_tendered NUMERIC(10, 2), -- Valor entregue (ex: deu nota de 50 pra pagar 45)
+    change_amount NUMERIC(10, 2) DEFAULT 0, -- Troco (ex: 5)
+    
+    installments INTEGER DEFAULT 1, -- Parcelas
+    card_brand VARCHAR(50), -- Visa, Master
+    auth_code VARCHAR(100), -- NSU / Autorização
 
-COMMENT ON TABLE sale_payments IS 'Formas de pagamento utilizadas em cada venda (pode haver múltiplas)';
-COMMENT ON COLUMN sale_payments.method IS 'Método: DINHEIRO, CREDITO, DEBITO, PIX, FIADO, etc';
-COMMENT ON COLUMN sale_payments.total IS 'Valor pago através deste método';
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID,
+
+    FOREIGN KEY (sale_id) REFERENCES sales(id) ON DELETE CASCADE,
+    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+);
 
 CREATE INDEX IF NOT EXISTS idx_sale_payments_sale ON sale_payments(sale_id);
-CREATE INDEX IF NOT EXISTS idx_sale_payments_method ON sale_payments(method);
-CREATE INDEX IF NOT EXISTS idx_sale_payments_created ON sale_payments(created_at DESC);
-
--- ============================================================================
--- PAGAMENTOS DE FIADO - Quitação de dívidas
--- ============================================================================
-
-CREATE TABLE IF NOT EXISTS tab_payments (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    sale_id UUID NOT NULL,
-    amount_paid NUMERIC(10, 2) NOT NULL,
-    payment_method payment_method_enum NOT NULL,
-    received_by UUID,
-    observation TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (sale_id) REFERENCES sales(id),
-    FOREIGN KEY (received_by) REFERENCES users(id),
-    CONSTRAINT tab_payments_positive_amount CHECK (amount_paid > 0)
-);
-
-COMMENT ON TABLE tab_payments IS 'Pagamentos realizados para quitar vendas fiadas (a prazo)';
-COMMENT ON COLUMN tab_payments.amount_paid IS 'Valor pago neste pagamento parcial';
-COMMENT ON COLUMN tab_payments.payment_method IS 'Forma de pagamento utilizada na quitação';
-COMMENT ON COLUMN tab_payments.received_by IS 'Funcionário que recebeu o pagamento';
-
-CREATE INDEX IF NOT EXISTS idx_tab_payments_sale ON tab_payments(sale_id);
-CREATE INDEX IF NOT EXISTS idx_tab_payments_created ON tab_payments(created_at DESC);
-
-CREATE OR REPLACE FUNCTION calculate_user_debt_balance(target_user_id UUID) 
-RETURNS NUMERIC AS $$
-DECLARE
-    total_debt NUMERIC(10, 2);
-    total_paid NUMERIC(10, 2);
-BEGIN
-    -- 1. Soma tudo que foi vendido como FIADO (apenas vendas não canceladas)
-    SELECT COALESCE(SUM(sp.total), 0)
-    INTO total_debt
-    FROM sale_payments sp
-    JOIN sales s ON s.id = sp.sale_id
-    WHERE s.customer_id = target_user_id
-      AND s.status != 'CANCELADA'
-      AND sp.method IN ('FIADO-EM-ABERTO', 'FIADO-PAGO-PARCIAL');
-
-    -- 2. Soma todos os pagamentos de dívida (tab_payments) já realizados
-    SELECT COALESCE(SUM(tp.amount_paid), 0)
-    INTO total_paid
-    FROM tab_payments tp
-    JOIN sales s ON s.id = tp.sale_id
-    WHERE s.customer_id = target_user_id;
-
-    -- Retorna o saldo (Dívida - Pago)
-    RETURN total_debt - total_paid;
-END;
-$$ LANGUAGE plpgsql;
+CREATE INDEX IF NOT EXISTS idx_sale_payments_created ON sale_payments(tenant_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sale_payments_method ON sale_payments(tenant_id, method);
+CREATE INDEX IF NOT EXISTS idx_sale_payments_sale_id ON sale_payments(tenant_id, sale_id);
 
 
-CREATE OR REPLACE FUNCTION trg_update_user_invoice_amount()
+CREATE OR REPLACE FUNCTION check_payment_total()
 RETURNS TRIGGER AS $$
 DECLARE
-    affected_customer_id UUID;
-    new_balance NUMERIC(10,2);
+    v_sale_total NUMERIC;
+    v_total_paid NUMERIC;
 BEGIN
-    -- Descobre quem é o cliente afetado dependendo da tabela de origem
+    -- Busca o total da venda
+    SELECT total_amount INTO v_sale_total FROM sales WHERE id = NEW.sale_id;
     
-    -- Caso 1: Movimentação em Pagamentos da Venda (sale_payments)
-    IF TG_TABLE_NAME = 'sale_payments' THEN
-        SELECT customer_id INTO affected_customer_id FROM sales WHERE id = COALESCE(NEW.sale_id, OLD.sale_id);
-    
-    -- Caso 2: Pagamento de Dívida (tab_payments)
-    ELSIF TG_TABLE_NAME = 'tab_payments' THEN
-        SELECT customer_id INTO affected_customer_id FROM sales WHERE id = COALESCE(NEW.sale_id, OLD.sale_id);
-    
-    -- Caso 3: Cancelamento de Venda (sales)
-    ELSIF TG_TABLE_NAME = 'sales' THEN
-        affected_customer_id := COALESCE(NEW.customer_id, OLD.customer_id);
-    END IF;
+    -- Calcula quanto já foi pago (somando o novo pagamento)
+    SELECT COALESCE(SUM(amount), 0) + NEW.amount 
+    INTO v_total_paid 
+    FROM sale_payments 
+    WHERE sale_id = NEW.sale_id AND id != NEW.id; -- Exclui o próprio se for update (embora update seja raro)
 
-    -- Se existe um cliente vinculado, atualiza o saldo dele
-    IF affected_customer_id IS NOT NULL THEN
-        -- Lock pessimista para evitar race condition
-        SELECT id INTO affected_customer_id 
-        FROM users 
-        WHERE id = affected_customer_id
-        FOR UPDATE;
-        
-        -- Calcula e atualiza atomicamente
-        new_balance := calculate_user_debt_balance(affected_customer_id);
-        
-        UPDATE users
-        SET invoice_amount = new_balance,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id = affected_customer_id;
-    END IF;
-
-    RETURN NULL; -- Trigger do tipo AFTER não precisa retornar NEW
+    -- Permite pequena margem de erro por arredondamento ou gorjeta, 
+    -- mas idealmente o backend controla isso. 
+    -- Aqui é apenas um 'sanity check' básico.
+    
+    RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
--- 1. Monitora quando uma venda é feita no Fiado (ou editada)
-CREATE OR REPLACE TRIGGER trg_audit_debt_sale_payments
-AFTER INSERT OR UPDATE OR DELETE ON sale_payments
-FOR EACH ROW EXECUTE FUNCTION trg_update_user_invoice_amount();
 
--- 2. Monitora quando o cliente paga a dívida
-CREATE OR REPLACE TRIGGER trg_audit_debt_tab_payments
-AFTER INSERT OR UPDATE OR DELETE ON tab_payments
-FOR EACH ROW EXECUTE FUNCTION trg_update_user_invoice_amount();
+CREATE OR REPLACE TRIGGER trg_check_payment_total
+BEFORE INSERT OR UPDATE ON sale_payments
+FOR EACH ROW EXECUTE FUNCTION check_payment_total();
 
--- 3. Monitora se uma venda foi cancelada (para remover a dívida)
-CREATE OR REPLACE TRIGGER trg_audit_debt_sales_status
-AFTER UPDATE OF status, customer_id ON sales
-FOR EACH ROW EXECUTE FUNCTION trg_update_user_invoice_amount();
 
 -- ============================================================================
 -- LOGS - Registro de eventos do sistema
@@ -761,10 +1279,6 @@ CREATE TABLE IF NOT EXISTS logs (
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP NOT NULL,
     CONSTRAINT chk_log_level CHECK (level IN ('DEBUG', 'INFO', 'WARN', 'ERROR', 'FATAL'))
 );
-
-COMMENT ON TABLE logs IS 'Registro de logs do sistema para auditoria e debugging';
-COMMENT ON COLUMN logs.level IS 'Nível de severidade do log';
-COMMENT ON COLUMN logs.metadata IS 'Dados adicionais em formato JSON';
 
 CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
 CREATE INDEX IF NOT EXISTS idx_logs_created_at ON logs(created_at DESC);
@@ -848,4 +1362,19 @@ FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 -- addresses
 CREATE OR REPLACE TRIGGER trg_addresses_updated_at
 BEFORE UPDATE ON addresses
+FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- fiscal_ncms
+CREATE OR REPLACE TRIGGER trg_fiscal_ncms_updated_at
+BEFORE UPDATE ON fiscal_ncms
+FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- categories
+CREATE OR REPLACE TRIGGER trg_categories_updated_at
+BEFORE UPDATE ON categories
+FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- batches
+CREATE OR REPLACE TRIGGER trg_batches_updated_at
+BEFORE UPDATE ON batches
 FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();

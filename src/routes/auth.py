@@ -1,11 +1,12 @@
 from fastapi import APIRouter, Depends, status, Response, Cookie, Header
-from src.schemas.auth import LoginRequest
-from src.schemas.user import UserResponse, UserCreate
-from src.schemas.rls import RLSConnection
 from src.security import get_postgres_connection, get_rls_connection
+from src.schemas.auth import LoginRequest
+from src.schemas.user import UserResponse
+from src.schemas.rls import RLSConnection
+from src.model import user as user_model
 from src.controller import auth
 from typing import Optional
-from asyncpg import Pool, Connection
+from asyncpg import Connection
 
 
 router = APIRouter()
@@ -17,7 +18,7 @@ router = APIRouter()
     response_model=UserResponse
 )
 async def get_me(rls: RLSConnection = Depends(get_rls_connection)):
-    return rls.user
+    return await user_model.get_user_by_id(rls.user['id'], rls.conn)
 
 
 @router.post(
@@ -52,6 +53,6 @@ async def refresh(
 async def logout(
     response: Response,
     refresh_token: Optional[str] = Cookie(default=None),
-    conn: RLSConnection = Depends(get_rls_connection)
+    conn: Connection = Connection(get_postgres_connection)
 ):
     await auth.logout(refresh_token, response, conn)

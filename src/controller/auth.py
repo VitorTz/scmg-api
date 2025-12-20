@@ -154,9 +154,9 @@ async def signup(user: UserCreate, rls: RLSConnection) -> UserResponse:
 
 async def logout(refresh_token: str, response: Response, conn: Connection) -> None:
     security.unset_session_token_cookie(response)
-    decoded_token: DecodedRefreshToken = security.decode_refresh_token(refresh_token)    
+    decoded_token: DecodedRefreshToken = security.decode_refresh_token(refresh_token)
     token: RefreshToken = await refresh_token_model.get_refresh_token_by_hash(
-        decoded_token.token_hash, 
+        decoded_token.token_hash,
         conn
     )
     if token and not token.revoked:
