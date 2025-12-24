@@ -12,38 +12,40 @@ class Token(BaseModel):
     
 class DecodedRefreshToken(BaseModel):
     
-    token_hash: str
-    family_id: Optional[UUID]
+    token_id: str
     
     
 class DecodedAccessToken(BaseModel):
     
     user_id: UUID
-    fgp: str
 
 
 class RefreshToken(BaseModel):
     
-    id: UUID    
+    id: UUID
     user_id: UUID
-    token_hash: str
-    device_hash: str
     family_id: Optional[UUID]
     expires_at: datetime
     created_at: datetime
     revoked: bool
     replaced_by: Optional[UUID]
     
+    
+class AccessTokenCreate(BaseModel):
+    
+    jwt_token: str
+    expires_at: datetime
+    
 
 class RefreshTokenCreate(BaseModel):
     
     user_id: UUID
+    token_id: UUID
     family_id: UUID
-    token_hash: str
-    device_hash: str
     expires_at: datetime
     revoked: bool
     replaced_by: Optional[UUID]
+    jwt_token: str
     
     
 

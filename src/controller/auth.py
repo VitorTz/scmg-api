@@ -2,7 +2,7 @@ from fastapi import status, Response
 from fastapi.exceptions import HTTPException
 from src.schemas.auth import LoginRequest
 from src.schemas.user import LoginData, UserResponse, UserCreate
-from src.schemas.token import RefreshToken, DecodedRefreshToken
+from src.schemas.token import RefreshToken, AccessTokenCreate, RefreshTokenCreate
 from src.schemas.rls import RLSConnection
 from src.model import user as user_model
 from src.model import refresh_token as refresh_token_model
@@ -10,7 +10,6 @@ from src.db.db import db_safe_exec, db
 from typing import Optional
 from asyncpg import Connection
 from src import security
-from uuid import UUID
 
 
 INVALID_CREDENTIALS = HTTPException(
@@ -33,12 +32,10 @@ async def login(
 ) -> UserResponse:
     
     if refresh_token:
-        try:
-            aux: DecodedRefreshToken = security.decode_refresh_token(refresh_token)
-            if aux.family_id:
-                await refresh_token_model.revoke_token_family(aux.family_id, conn)
-        except Exception:
-            pass
+        await refresh_token_model.revoke_token_family_by_token_id(
+            security.decode_refresh_token(refresh_token).token_id,
+            conn
+        )
         
     data: Optional[LoginData] = await db_safe_exec(user_model.get_login_data(login_req, conn))
     
@@ -54,24 +51,21 @@ async def login(
     if not security.verify_password(login_req.password, data.password_hash):
         raise INVALID_CREDENTIALS
     
-    access_token, access_token_expires_at = security.create_access_token(data.id, login_req.fingerprint)
+    access_token_create: AccessTokenCreate = security.create_access_token(data.id)
     
-    create_refresh_token, refresh_token, refresh_token_expires_at = security.create_refresh_token(
-        data.id,
-        login_req.fingerprint
-    )
+    refresh_token_create: RefreshTokenCreate = security.create_refresh_token(data.id)
     
     await db_safe_exec(
         user_model.update_user_last_login(data.id, conn),
-        refresh_token_model.create_refresh_token(create_refresh_token, conn)
+        refresh_token_model.create_refresh_token(refresh_token_create, conn)
     )
         
     security.set_session_token_cookie(
         response, 
-        access_token,
-        access_token_expires_at,
-        refresh_token,
-        refresh_token_expires_at
+        access_token_create.jwt_token,
+        access_token_create.expires_at,
+        refresh_token_create.jwt_token,
+        refresh_token_create.expires_at
     )
     
     return UserResponse(
@@ -93,52 +87,49 @@ async def login(
     
 async def refresh(
     refresh_token: Optional[str],
-    x_device_id: str,
     response: Response,
     conn: Connection    
 ) -> UserResponse:
     if not refresh_token: 
         raise INVALID_REFRESH_TOKEN
         
-    token: RefreshToken = await refresh_token_model.get_refresh_token_by_hash(
-        security.decode_refresh_token(refresh_token).token_hash, 
+    old_token: RefreshToken = await refresh_token_model.get_refresh_token_by_id(
+        security.decode_refresh_token(refresh_token).token_id,
         conn
     )
     
-    if not token:
+    if not old_token:
         raise INVALID_REFRESH_TOKEN
         
-    if token.revoked or not security.sha256_verify(x_device_id, token.device_hash):
+    if old_token.revoked:
         if db.pool:            
             async with db.pool.acquire() as temp_conn:
-                await refresh_token_model.revoke_token_family(token.family_id, temp_conn)
+                await refresh_token_model.revoke_token_family(old_token.family_id, temp_conn)
         raise INVALID_REFRESH_TOKEN
     
-    user: Optional[UserResponse] = await user_model.get_user_by_id(token.user_id, conn)
+    user: Optional[UserResponse] = await user_model.get_user_by_id(old_token.user_id, conn)
     
     if not user:
         if db.pool:
             async with db.pool.acquire() as temp_conn:
-                await refresh_token_model.revoke_token_family(token.family_id, temp_conn)
+                await refresh_token_model.revoke_token_family(old_token.family_id, temp_conn)
         raise INVALID_REFRESH_TOKEN
     
-    access_token, access_token_expires_at = security.create_access_token(user.id, x_device_id)
+    access_token_create: AccessTokenCreate = security.create_access_token(user.id)
     
-    create_refresh_token, refresh_token, refresh_token_expires_at = security.create_refresh_token(
-        user.id,
-        x_device_id,
-        token.family_id
+    refresh_token_create: RefreshTokenCreate = security.create_refresh_token(user.id, old_token.family_id)
+    
+    await db_safe_exec(
+        refresh_token_model.create_refresh_token(refresh_token_create, conn),
+        refresh_token_model.invalidate_token(old_token.id, refresh_token_create.token_id, conn)
     )
-    
-    new_token_id: UUID = await db_safe_exec(refresh_token_model.create_refresh_token(create_refresh_token, conn))
-    await db_safe_exec(refresh_token_model.invalidate_token(token.id, new_token_id, conn))
     
     security.set_session_token_cookie(
         response,
-        access_token,
-        access_token_expires_at,
-        refresh_token,
-        refresh_token_expires_at
+        access_token_create.jwt_token,
+        access_token_create.expires_at,
+        refresh_token_create.jwt_token,
+        refresh_token_create.expires_at
     )
     
     return user
@@ -154,11 +145,8 @@ async def signup(user: UserCreate, rls: RLSConnection) -> UserResponse:
 
 async def logout(refresh_token: str, response: Response, conn: Connection) -> None:
     security.unset_session_token_cookie(response)
-    decoded_token: DecodedRefreshToken = security.decode_refresh_token(refresh_token)
-    token: RefreshToken = await refresh_token_model.get_refresh_token_by_hash(
-        decoded_token.token_hash,
+    await refresh_token_model.revoke_token_family_by_token_id(
+        security.decode_refresh_token(refresh_token).token_id,
         conn
     )
-    if token and not token.revoked:
-        await refresh_token_model.revoke_token_family(token.family_id, conn)
         

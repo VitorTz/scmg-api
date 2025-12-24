@@ -1,6 +1,6 @@
-# SCMG API (Sistema de Controle de Mercados, Lojas e Bares/Restaurantes)
+# Virtus API (Sistema de Controle de Mercados, Lojas e Bares/Restaurantes)
 
-SCMG (Santa Catarina Market Gestor) é uma API RESTful robusta, segura e Multi-Tenant desenvolvida para orquestrar o ecossistema SCMG. Esta aplicação serve como o backend centralizado para duas interfaces clientes:
+Virtus é uma API RESTful robusta, segura e Multi-Tenant desenvolvida para orquestrar o ecossistema SCMG. Esta aplicação serve como o backend centralizado para duas interfaces clientes:
 
 
 1. Desktop Client (JavaFX): PDV completo com emissão fiscal (NFCe/NFe)

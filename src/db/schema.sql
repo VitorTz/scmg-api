@@ -916,21 +916,16 @@ CREATE TABLE IF NOT EXISTS user_addresses (
 CREATE TABLE IF NOT EXISTS refresh_tokens (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     user_id UUID NOT NULL,
-    token_hash TEXT NOT NULL, -- Hash do token enviado ao cliente
-    device_hash TEXT NOT NULL, -- O Fingerprint do hardware (Segurança Extra)
     expires_at TIMESTAMPTZ NOT NULL,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     revoked BOOLEAN DEFAULT FALSE,
     family_id UUID NOT NULL,
     replaced_by UUID REFERENCES refresh_tokens(id),
-    CONSTRAINT refresh_tokens_valid_token_hash CHECK (length(token_hash) = 64 AND token_hash ~ '^[a-f0-9]{64}$'),
-    CONSTRAINT refresh_tokens_valid_device_hash CHECK (length(device_hash) = 64 AND device_hash ~ '^[a-f0-9]{64}$'),
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE ON UPDATE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_refresh_token_family ON refresh_tokens(family_id);
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_active_family ON refresh_tokens(family_id) WHERE revoked = FALSE;
-CREATE INDEX IF NOT EXISTS idx_refresh_token_hash ON refresh_tokens(token_hash);
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_expires_at ON refresh_tokens (expires_at);
 
 -- ============================================================================

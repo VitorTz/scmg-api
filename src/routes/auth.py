@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, status, Response, Cookie, Header
+from fastapi import APIRouter, Depends, status, Response, Cookie
 from src.security import get_postgres_connection, get_rls_connection
 from src.schemas.auth import LoginRequest
 from src.schemas.user import UserResponse
@@ -36,17 +36,16 @@ async def login(
 
 
 @router.post(
-    "/refresh", 
+    "/refresh",
     status_code=status.HTTP_200_OK, 
     response_model=UserResponse
 )
 async def refresh(
     response: Response,
     refresh_token: Optional[str] = Cookie(default=None),
-    x_device_id: str = Header(...),
     conn: Connection = Depends(get_postgres_connection)
 ):    
-    return await auth.refresh(refresh_token, x_device_id, response, conn)
+    return await auth.refresh(refresh_token, response, conn)
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)

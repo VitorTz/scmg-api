@@ -19,6 +19,14 @@ pwd_context = CryptContext(
 )
 
 
+def remove_non_numbers(word: str) -> str:
+    r = ''
+    for letter in word:
+        if letter.isdigit():
+            r += letter
+    return r
+
+
 def hash_password(password: str) -> str:
     if not password or len(password) < 8:
         raise INVALID_PASSWORD_EXCEPTION
@@ -36,8 +44,8 @@ def create_superuser():
         # Inputs limpos
         name = input("Nome: ").strip()
         email = input("Email: ").strip()
-        phone = input("Telefone (apenas números): ").strip()
-        cpf = input("CPF (apenas números): ").strip()
+        phone = remove_non_numbers(input("Telefone (apenas números): "))
+        cpf = remove_non_numbers(input("CPF (apenas números): "))
         raw_password = input("Senha: ").strip()
         tenant_id_str = input("Tenant UUID: ").strip()
 
