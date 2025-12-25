@@ -56,7 +56,7 @@ async def revoke_token_family(family_id: UUID, conn: Connection):
         family_id
     )
     
-async def revoke_token_family_by_token_id(token_id: UUID, conn: Connection):
+async def revoke_token_family_by_token_id(token_id: UUID, conn: Connection):    
     await conn.execute(
         """
         UPDATE 

@@ -66,11 +66,23 @@ async def get_user_feedbacks(
     """
 
     data_query = f"""
-        SELECT id, user_id, name, email, bug_type, message, created_at
-        FROM user_feedbacks
+        SELECT 
+            id, 
+            user_id, 
+            name, 
+            email, 
+            bug_type, 
+            message, 
+            created_at
+        FROM 
+            user_feedbacks
         {where_sql}
-        ORDER BY created_at DESC
-        LIMIT $limit OFFSET $offset
+        ORDER BY 
+            created_at DESC
+        LIMIT 
+            $limit 
+        OFFSET 
+            $offset
     """
 
     total = await conn.fetchval(total_query, **values)

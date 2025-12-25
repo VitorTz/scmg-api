@@ -1,13 +1,16 @@
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, status, Query
+from fastapi_limiter.depends import RateLimiter
 from src.schemas.user import UserResponse, UserCreate
 from src.schemas.rls import RLSConnection
 from src.schemas.staff import UserRoleUpdate
+from src.schemas.general import Pagination
 from src.security import get_rls_connection
 from src.model import user as user_model
-from src.controller import auth
+from src.services import auth as auth_service
+from src.services import staff as staff_service
 
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(RateLimiter(times=32, seconds=60))])
 
 
 @router.post(
@@ -16,7 +19,20 @@ router = APIRouter()
     response_model=UserResponse    
 )
 async def register_user(user: UserCreate, rls: RLSConnection = Depends(get_rls_connection)):
-    return await auth.signup(user, rls)
+    return await auth_service.signup(user, rls)
+
+
+@router.get(
+    "/members",
+    status_code=status.HTTP_200_OK,
+    response_model=Pagination[UserResponse]
+)
+async def staff_members(
+    limit: int = Query(default=64, ge=0, le=64),
+    offset: int = Query(default=0, ge=0),
+    rls: RLSConnection = Depends(get_rls_connection)
+):
+    return await user_model.get_staff_members(rls.conn, limit, offset)
 
 
 @router.post(
@@ -25,26 +41,4 @@ async def register_user(user: UserCreate, rls: RLSConnection = Depends(get_rls_c
     response_model=UserResponse
 )
 async def update_roles(data: UserRoleUpdate, rls: RLSConnection = Depends(get_rls_connection)):
-    await rls.conn.execute(
-        """
-        WITH deleted AS (
-            DELETE FROM 
-                user_roles
-            WHERE 
-                user_id = $1
-        )
-        INSERT INTO user_roles (
-            id, 
-            role
-        )
-        SELECT 
-            $1, 
-            unnest($2::text[])
-        ON CONFLICT 
-            (id, role) 
-        DO NOTHING
-        """,
-        data.user_id,
-        data.roles 
-    )
-    return user_model.get_user_by_id(data.user_id, rls.conn)
+    return await staff_service.update_user_roles(data, rls.conn)

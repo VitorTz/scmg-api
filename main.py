@@ -1,6 +1,7 @@
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.exceptions import HTTPException, RequestValidationError
 from fastapi import FastAPI, Response, Request, status
+from fastapi_limiter import FastAPILimiter
 from starlette.middleware.gzip import GZipMiddleware
 from src.monitor import periodic_update, get_monitor
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,14 +13,16 @@ from src.constants import Constants
 from src.routes import auth
 from src.routes import feedback
 from src.routes import currency
-from src.routes import cnpj
+from src.routes import companies
 from src.routes import staff
 from src.routes import address
+from src.routes import ncm
+from src.routes import monitor
+from src.routes import logs
 from src.model import log as log_model
 from src.db.db import db
+from src.services.redis_client import RedisService
 from src import middleware
-from src import util
-from src.globals import globals_get_redis_client
 import uvicorn
 import contextlib
 import asyncio
@@ -30,6 +33,9 @@ import time
 async def lifespan(app: FastAPI):
     print(f"[API] [STARTING {Constants.API_NAME}]")    
     
+    # [Redis]
+    await RedisService.check_connection()
+    
     # [PostgreSql INIT]
     await db.connect()
     
@@ -38,10 +44,16 @@ async def lifespan(app: FastAPI):
     
     # [Cloudflare]
     app.state.r2 = await CloudflareR2Bucket.get_instance()
+    
+    # [Limiter]
+    await FastAPILimiter.init(RedisService.get_client())
 
     print(f"[API] [{Constants.API_NAME} STARTED]")
 
     yield
+    
+    # [Redis]
+    await RedisService.close()
     
     # [SystemMonitor]
     task.cancel()
@@ -101,12 +113,15 @@ app.include_router(staff.router, prefix='/api/v1/staff', tags=['staff'])
 app.include_router(feedback.router, prefix='/api/v1/feedback', tags=['feedback'])
 app.include_router(currency.router, prefix='/api/v1/currency', tags=['currency'])
 app.include_router(address.router, prefix='/api/v1/cep', tags=['cep'])
-app.include_router(cnpj.router, prefix='/api/v1/cnpj', tags=['cnpj'])
-
+app.include_router(companies.router, prefix='/api/v1/companies', tags=['companies'])
+app.include_router(ncm.router, prefix='/api/v1/ncm', tags=['ncm'])
+app.include_router(monitor.router, prefix='/api/v1/admin/monitor', tags=['monitor'])
+app.include_router(logs.router, prefix='/api/v1/admin/logs', tags=['logs'])
 
 ########################## MIDDLEWARES ##########################
 
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+
 
 @app.middleware("http")
 async def http_middleware(request: Request, call_next):
@@ -131,48 +146,11 @@ async def http_middleware(request: Request, call_next):
                 )
         request._body = body
     
-    # Rate limit check
-    identifier = util.get_client_identifier(request)
-    key = f"rate_limit:{identifier}"
-    
-    pipe = globals_get_redis_client().pipeline()
-    pipe.incr(key)
-    pipe.expire(key, Constants.WINDOW)
-    results = await pipe.execute()
-    
-    current = results[0]
-    ttl = await globals_get_redis_client().ttl(key)
-    
-    if current > Constants.MAX_REQUESTS:    
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail={
-                "error": "Too many requests",
-                "message": f"Rate limit exceeded. Try again in {ttl} seconds.",
-                "retry_after": ttl,
-                "limit": Constants.MAX_REQUESTS,
-                "window": Constants.WINDOW
-            },
-            headers={
-                "Retry-After": str(ttl),
-                "X-RateLimit-Limit": str(Constants.MAX_REQUESTS),
-                "X-RateLimit-Remaining": "0",
-                "X-RateLimit-Reset": str(ttl)
-            }
-        )
-    
-    response: Response = await call_next(request)
-    
-    # Headers
-    remaining = max(Constants.MAX_REQUESTS - current, 0)
-    response.headers["X-RateLimit-Limit"] = str(Constants.MAX_REQUESTS)
-    response.headers["X-RateLimit-Remaining"] = str(remaining)
-    response.headers["X-RateLimit-Reset"] = str(ttl)        
+    response: Response = await call_next(request)        
     middleware.add_security_headers(request, response)
-    response_time_ms = (time.perf_counter() - start_time) * 1000
-    response.headers["X-Response-Time"] = f"{response_time_ms:.2f}ms"
     
     # System Monitor
+    response_time_ms = (time.perf_counter() - start_time) * 1000    
     get_monitor().increment_request(response_time_ms)
 
     return response

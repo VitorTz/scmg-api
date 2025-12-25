@@ -11,11 +11,6 @@ class LoginRequest(BaseModel):
         ...,
         description="Senha em texto plano"
     )
-    
-    fingerprint: str = Field(
-        ...,
-        description='Identificador único do cliente que está fazendo a requisição.'
-    )
 
     @field_validator('identifier')
     @classmethod
@@ -25,9 +20,4 @@ class LoginRequest(BaseModel):
     @field_validator('password')
     @classmethod
     def validate_password(cls, v: str) -> str:
-        return v.strip()
-    
-    @field_validator('fingerprint')
-    @classmethod
-    def validate_fingerprint(cls, v: str) -> str:
         return v.strip()

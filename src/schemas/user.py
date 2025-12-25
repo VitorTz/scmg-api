@@ -100,8 +100,6 @@ class UserCreate(BaseModel):
         pattern=r'^\d{11}$',
         description="CPF (apenas números)"
     )
-        
-    credit_limit: Decimal = Field(default=Decimal('0.00'), ge=0)
     
     @field_validator('phone', 'cpf', mode='before')
     @classmethod
@@ -124,7 +122,6 @@ class UserUpdate(BaseModel):
     
     role: UserRole
     state_tax_indicator: int
-    credit_limit: Optional[Decimal] = Field(..., ge=0)
     
     phone: Optional[str] = Field(
         default=None,
@@ -154,8 +151,6 @@ class UserResponse(UserBase):
     
     id: UUID    
     tenant_id: UUID
-    credit_limit: Decimal
-    invoice_amount: Decimal
     created_at: datetime
     updated_at: datetime
     created_by: Optional[UUID]

@@ -9,7 +9,7 @@
 
 -- Retorna o user_id da sessão atual
 CREATE OR REPLACE FUNCTION current_user_id()
-RETURNS UUID AS $$
+RETURNS UUID SET search_path = public, extensions, pg_temp AS $$
 BEGIN
     RETURN NULLIF(current_setting('app.current_user_id', TRUE), '')::UUID;
 EXCEPTION
@@ -20,7 +20,7 @@ $$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
 
 -- Retorna o tenant_id da sessão atual
 CREATE OR REPLACE FUNCTION current_user_tenant_id()
-RETURNS UUID AS $$
+RETURNS UUID SET search_path = public, extensions, pg_temp AS $$
 BEGIN
     RETURN NULLIF(current_setting('app.current_user_tenant_id', TRUE), '')::UUID;
 EXCEPTION
@@ -31,12 +31,12 @@ $$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
 
 -- Retorna as roles do usuário atual
 CREATE OR REPLACE FUNCTION current_user_roles()
-RETURNS user_role_enum[] AS $$
+RETURNS user_role_enum[] SET search_path = public, extensions, pg_temp AS $$
 BEGIN
-    RETURN string_to_array(
-        NULLIF(current_setting('app.current_user_roles', TRUE), ''),
-        ','
-    )::user_role_enum[];
+    RETURN COALESCE(
+        NULLIF(current_setting('app.current_user_roles', TRUE), '')::user_role_enum[],
+        ARRAY[]::user_role_enum[]
+    );
 EXCEPTION
     WHEN OTHERS THEN RETURN ARRAY[]::user_role_enum[];
 END;
@@ -45,7 +45,7 @@ $$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
 
 -- Retorna o nível máximo de privilégio do usuário atual
 CREATE OR REPLACE FUNCTION current_user_max_privilege()
-RETURNS INTEGER AS $$
+RETURNS INTEGER SET search_path = public, extensions, pg_temp AS $$
 BEGIN    
     RETURN COALESCE(
         NULLIF(current_setting('app.current_user_max_privilege', TRUE), '')::INTEGER,
@@ -57,13 +57,36 @@ END;
 $$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
 
 
+-- Função unificada para debug e log de segurança
+CREATE OR REPLACE FUNCTION get_session_context_log()
+RETURNS JSONB SET search_path = public, extensions, pg_temp AS $$
+DECLARE
+    v_context JSONB;
+BEGIN
+    v_context := jsonb_build_object(
+        'user_id',       current_user_id(),
+        'tenant_id',     current_user_tenant_id(),
+        'roles',         current_user_roles(),
+        'privilege',     current_user_max_privilege(),
+        'timestamp_utc', now()
+    );
+
+    RETURN v_context;
+EXCEPTION
+    WHEN OTHERS THEN
+        -- Fallback de segurança para nunca quebrar a aplicação se o log falhar
+        RETURN jsonb_build_object('error', 'Failed to retrieve session context', 'details', SQLERRM);
+END;
+$$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
+
+
 -- ============================================================================
 -- FUNCTIONS
 -- ============================================================================
 
 -- Verifica se o usuário tem pelo menos uma das roles especificadas
 CREATE OR REPLACE FUNCTION current_user_has_any_role(required_roles user_role_enum[])
-RETURNS BOOLEAN AS $$
+RETURNS BOOLEAN SET search_path = public, extensions, pg_temp AS $$
 BEGIN
     RETURN current_user_roles() && required_roles;
 END;
@@ -73,25 +96,14 @@ $$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
 -- Cria automaticamente tenant_id e created_by
 -- Impede a mudança de tenant_id
 CREATE OR REPLACE FUNCTION fn_set_tenant_and_creator()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER SET search_path = public, extensions, pg_temp AS $$
 BEGIN
-
-    -- 1. Verifica se o usuário da sessão é 'postgres'.
-    -- Se for, retorna NEW imediatamente, permitindo que o admin
-    -- insira ou atualize dados manualmente (útil para backup/restore e seeds).
-    IF SESSION_USER = 'postgres' THEN
-        RETURN NEW;
-    END IF;
-
-    -- Define tenant_id do usuário atual (não pode ser alterado depois)
     IF TG_OP = 'INSERT' THEN
         NEW.tenant_id := current_user_tenant_id();
-        IF NEW.created_by IS NULL THEN
-            NEW.created_by := current_user_id();
-        END IF;
+        NEW.created_by := current_user_id();
     ELSIF TG_OP = 'UPDATE' THEN
-        NEW.tenant_id := OLD.tenant_id; -- Impede alteração do tenant_id
-        NEW.created_by := OLD.created_by; -- Impede alteração de created_by
+        NEW.tenant_id := OLD.tenant_id; 
+        NEW.created_by := OLD.created_by;
     END IF;
     
     RETURN NEW;
@@ -102,12 +114,8 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;
 -- Cria automaticamente tenant_id
 -- Impede a mudança de tenant_id
 CREATE OR REPLACE FUNCTION fn_set_tenant()
-RETURNS TRIGGER AS $$
-BEGIN
-
-    -- 1. Verifica se o usuário da sessão é 'postgres'.
-    -- Se for, retorna NEW imediatamente, permitindo que o admin
-    -- insira ou atualize dados manualmente (útil para backup/restore e seeds).
+RETURNS TRIGGER SET search_path = public, extensions, pg_temp AS $$
+BEGIN    
     IF SESSION_USER = 'postgres' THEN
         RETURN NEW;
     END IF;
@@ -126,7 +134,7 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;
 
 -- Para auditar mudanças na tabela de usuários
 CREATE OR REPLACE FUNCTION fn_users_audit_changes()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER SET search_path = public, extensions, pg_temp AS $$
 BEGIN
     IF TG_OP = 'UPDATE' THEN
         INSERT INTO security_audit_log (
@@ -163,6 +171,9 @@ BEGIN
             row_to_json(NEW)::jsonb - 'password_hash' - 'quick_access_pin_hash'
         );
     END IF;
+
+    EXCEPTION WHEN OTHERS THEN
+        RAISE EXCEPTION 'AUDITORIA FALHOU: % - Operação bloqueada para segurança', SQLERRM;      
     
     RETURN COALESCE(NEW, OLD);
 END;
@@ -171,7 +182,7 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;
 
 -- Função para garantir que sempre existe pelo menos um ADMIN
 CREATE OR REPLACE FUNCTION fn_ensure_at_least_one_admin()
-RETURNS TRIGGER SECURITY DEFINER AS $$
+RETURNS TRIGGER SECURITY DEFINER SET search_path = public, extensions, pg_temp AS $$
 DECLARE
     admin_count INTEGER;
     is_removing_admin_privilege BOOLEAN := FALSE;
@@ -208,13 +219,19 @@ BEGIN
 
     -- Se detectamos perigo, fazemos a contagem cara (Count)
     IF is_removing_admin_privilege THEN
-        SELECT COUNT(*) INTO admin_count
-            FROM users
-        WHERE tenant_id = OLD.tenant_id
+        LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE;
+
+        SELECT 
+            COUNT(*) 
+        INTO 
+            admin_count
+        FROM 
+            users
+        WHERE 
+            tenant_id = OLD.tenant_id
             AND 'ADMIN' = ANY(roles)
             AND is_active = TRUE
-            AND id != OLD.id
-        FOR UPDATE;
+            AND id != OLD.id;
         
         IF admin_count = 0 THEN
             RAISE EXCEPTION 'Não é possível remover o último ADMIN do tenant. Deve existir pelo menos um ADMIN ativo.';
@@ -365,77 +382,30 @@ CREATE POLICY tenants_select_policy ON tenants
 ALTER TABLE users ENABLE ROW LEVEL SECURITY;
 ALTER TABLE users FORCE ROW LEVEL SECURITY;
 
--- SELECT: Todos veem clientes, nível de privilégio >= 80 vê tudo
-DROP POLICY users_select_policy ON users;
-CREATE POLICY users_select_policy ON users
-    FOR SELECT
-    USING (
-        tenant_id = current_user_tenant_id() -- mesmo tenant
-        AND (
-            max_privilege_level = 0 -- Todos veem clientes
-            OR
-            current_user_max_privilege() >= 80
-            OR
-            id = current_user_id() -- Todos veem a si mesmos
-        )
-    );
-
--- INSERT: Apenas ADMIN/GERENTE criam contas, exceto CLIENTE (todos podem criar clientes)
-DROP POLICY users_insert_policy ON users;
-CREATE POLICY users_insert_policy ON users
-    FOR INSERT
-    WITH CHECK (        
-        tenant_id = current_user_tenant_id() -- Isolamento de Tenant
-        AND (
-            -- Funcionário com privilégio 70+ pode criar qualquer conta
-            -- com mesmo nível ou menos
-            (
-                current_user_max_privilege() >= 70 AND
-                current_user_max_privilege() >= max_privilege_level
-            )
-            OR
-            -- Clientes podem ser criados por qualquer funcionário autenticado
-            (current_user_max_privilege() > 0 AND max_privilege_level = 0)
-        )
-    );
-
--- UPDATE: Mesmas regras do INSERT + usuário pode atualizar a si mesmo
-DROP POLICY users_update_policy ON users;
-CREATE POLICY users_update_policy ON users
-    FOR UPDATE
-    USING (
-        tenant_id = current_user_tenant_id() -- Isolamento Sempre
-        AND (
-            id = current_user_id() -- Usuário pode mudar            
-            OR            
-            -- GESTÃO DE EQUIPE
-            (
-                -- Preciso ser Fiscal (70) ou superior
-                current_user_max_privilege() >= 70
-                AND
-                -- O alvo que estou editando deve ser hierarquicamente IGUAL ou INFERIOR a mim
-                current_user_max_privilege() >= max_privilege_level
-            )
-        )
+DROP POLICY IF EXISTS users_select_policy ON users;
+CREATE POLICY users_select_policy ON users FOR SELECT USING (
+    tenant_id = current_user_tenant_id()
+    AND (
+        max_privilege_level = 0 OR
+        current_user_max_privilege() >= 80 OR
+        id = current_user_id()
     )
-    WITH CHECK (
-        tenant_id = current_user_tenant_id() -- Não pode mudar o usuário de loja
-        AND (
-            -- Usuário não pode dar privilégios que não tem
-            current_user_max_privilege() >= max_privilege_level
-        )
-    );
+);
 
--- DELETE
-DROP POLICY users_delete_policy ON users;
-CREATE POLICY users_delete_policy ON users
-    FOR DELETE
-    USING (
-        tenant_id = current_user_tenant_id()
-        AND id != current_user_id() -- Ninguém deleta a si mesmo
-        AND current_user_max_privilege() >= 92 -- Privilégio += 92
-        AND current_user_max_privilege() >= max_privilege_level -- Privilégio += de tem estou deletando
-    );
+DROP POLICY IF EXISTS users_insert_policy ON users;
+CREATE POLICY users_insert_policy ON users FOR INSERT WITH CHECK (
+    tenant_id = current_user_tenant_id() 
+);
+
+DROP POLICY IF EXISTS users_update_policy ON users;
+CREATE POLICY users_update_policy ON users FOR UPDATE USING (
+    tenant_id = current_user_tenant_id()
+);
+
+DROP POLICY IF EXISTS users_delete_policy ON users;
+CREATE POLICY users_delete_policy ON users FOR DELETE USING (
+    tenant_id = current_user_tenant_id()
+);
 
 -- ============================================================================
 -- CATEGORIES
@@ -1053,7 +1023,7 @@ CREATE POLICY sale_items_delete_policy ON sale_items
 
 
 CREATE OR REPLACE FUNCTION protect_sensitive_sale_columns()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER SET search_path = public, extensions, pg_temp AS $$
 BEGIN
     -- Se não for Admin (120) ou Gerente (99), proíbe mexer em custo e imposto
     IF current_user_max_privilege() < 99 THEN
@@ -1071,6 +1041,19 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE TRIGGER trg_sale_items_protect_columns
 BEFORE UPDATE ON sale_items
 FOR EACH ROW EXECUTE FUNCTION protect_sensitive_sale_columns();
+
+-- ============================================================================
+-- APP TOKENS
+-- ============================================================================
+
+ALTER TABLE app_tokens ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app_tokens FORCE ROW LEVEL SECURITY;
+
+-- [SELECT]: Leitura pública
+DROP POLICY IF EXISTS app_tokens_public_read ON app_tokens;
+CREATE POLICY app_tokens_public_read ON app_tokens
+    FOR SELECT
+    USING (true);
 
 -- ============================================================================
 -- SALE_PAYMENTS
@@ -1187,7 +1170,6 @@ CREATE POLICY fiscal_payment_codes_public_read ON fiscal_payment_codes
     USING (true);
 
 
-
 -- ============================================================================
 -- CNPJS
 -- ============================================================================
@@ -1215,53 +1197,3 @@ CREATE POLICY currencies_public_read ON currencies
     FOR SELECT
     USING (true);
 
--- ============================================================================
--- VERIFICAÇÃO DE SEGURANÇA
--- ============================================================================
-
--- Query para verificar se todas as tabelas com tenant_id têm RLS habilitado
-DO $$
-DECLARE
-    tbl_record RECORD;
-    missing_rls TEXT[] := ARRAY[]::TEXT[];
-    missing_force TEXT[] := ARRAY[]::TEXT[];
-BEGIN
-    FOR tbl_record IN 
-        SELECT 
-            t.tablename,
-            pc.relrowsecurity AS has_rls,
-            pc.relforcerowsecurity AS has_force
-        FROM pg_tables t
-        JOIN information_schema.columns c 
-            ON c.table_name = t.tablename 
-            AND c.table_schema = t.schemaname
-        JOIN pg_class pc ON pc.relname = t.tablename
-        JOIN pg_namespace pn ON pc.relnamespace = pn.oid AND pn.nspname = t.schemaname
-        WHERE t.schemaname = 'public'
-        AND c.column_name = 'tenant_id'
-    LOOP
-        -- Checa se RLS está habilitado (ENABLE)
-        IF NOT tbl_record.has_rls THEN
-            missing_rls := array_append(missing_rls, tbl_record.tablename);
-        END IF;
-
-        -- Checa se o FORCE RLS está ativo (Obrigatório para SaaS seguro)
-        IF NOT tbl_record.has_force THEN
-            missing_force := array_append(missing_force, tbl_record.tablename);
-        END IF;
-    END LOOP;
-    
-    -- Reporta RLS faltando
-    IF array_length(missing_rls, 1) > 0 THEN
-        RAISE WARNING 'PERIGO: Tabelas sem RLS habilitado: %', array_to_string(missing_rls, ', ');
-    END IF;
-
-    -- Reporta FORCE faltando
-    IF array_length(missing_force, 1) > 0 THEN
-        RAISE WARNING 'ATENÇÃO: Tabelas sem FORCE RLS (Dono ignora segurança): %', array_to_string(missing_force, ', ');
-    END IF;
-
-    IF array_length(missing_rls, 1) IS NULL AND array_length(missing_force, 1) IS NULL THEN
-        RAISE NOTICE '✓ Segurança Total: Todas as tabelas de tenant estão protegidas com ENABLE e FORCE RLS.';
-    END IF;
-END $$;

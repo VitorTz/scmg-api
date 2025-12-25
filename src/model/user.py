@@ -1,82 +1,39 @@
 from src.schemas.user import LoginData, UserResponse, UserCreate
 from src.schemas.auth import LoginRequest
 from asyncpg import Connection, Record
+from src.schemas.general import Pagination
 from typing import Optional
 from uuid import UUID
-import re
 
 
 async def get_login_data(login: LoginRequest, conn: Connection) -> Optional[LoginData]:
-    clean = login.identifier.strip().lower()
-    numeric = re.sub(r'\D', '', login.identifier)
-        
-    base_query = """
-        SELECT 
-            u.id,
-            u.name,
-            u.nickname,
-            u.email,
-            u.password_hash,
-            u.notes,
-            u.state_tax_indicator,
-            u.credit_limit,
-            u.invoice_amount,
-            u.created_at,
-            u.created_by,
-            u.updated_at,
-            u.tenant_id,
-            COALESCE(array_agg(ur.role), '{}') AS roles
-        FROM 
-            users u
-        LEFT JOIN 
-            user_roles ur ON u.id = ur.id
-        WHERE
-
-    """
-        
-    row = None    
-    
-    if '@' in clean: # EMAIL
-        query = base_query + "LOWER(u.email) = $1 GROUP BY u.id"
-        row = await conn.fetchrow(query, clean)
-    elif len(numeric) == 11: # CPF
-        query = base_query + "u.cpf = $1 GROUP BY u.id"
-        row = await conn.fetchrow(query, numeric)     
-
+    row = await conn.fetchrow("SELECT * FROM get_user_login_data($1)", login.identifier)
     return LoginData(**dict(row)) if row else None
 
 
 async def update_user_last_login(user_id: str | UUID, conn: Connection) -> None:
-    await conn.execute(
-        "UPDATE users SET last_login_at = CURRENT_TIMESTAMP WHERE id = $1", 
-        user_id
-    )
+    await conn.execute("SELECT update_last_login_safe($1::uuid)", user_id)
+
 
 async def get_user_by_id(id: str | UUID, conn: Connection) -> UserResponse:
     row = await conn.fetchrow(
         """
         SELECT  
-            u.id,
-            u.name,
-            u.nickname,
-            u.email,
-            u.notes,
-            u.state_tax_indicator,
-            u.credit_limit,
-            u.invoice_amount,
-            u.created_at,
-            u.updated_at,
-            u.created_by,
-            u.tenant_id,
-            COALESCE(array_agg(ur.role), '{}') AS roles
+            id,
+            name,
+            nickname,
+            email,
+            notes,
+            state_tax_indicator,
+            created_at,
+            updated_at,
+            created_by,
+            tenant_id,
+            roles
         FROM
-            users u
-        LEFT JOIN 
-            user_roles ur ON u.id = ur.id
+            users
         WHERE
-            u.id = $1
-        GROUP BY 
-            u.id
+            id = $1
         """,
         id
     )
@@ -92,9 +49,9 @@ async def get_user_rls_data(id: str | UUID, conn: Connection) -> Record:
                 roles,
                 max_privilege_level
             FROM
-                users u
+                users
             WHERE
-                id = id
+                id = $1
         """,
         id
     )
@@ -117,22 +74,22 @@ async def create_user(
                 password_hash,
                 phone,
                 cpf,
-                credit_limit
+                roles
             )
             VALUES
-                ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             RETURNING
                 id,
                 name,
+                tenant_id,
                 nickname,
                 email,
                 notes,
                 state_tax_indicator,
-                credit_limit,
-                invoice_amount,
                 created_at,
                 updated_at,
-                created_by
+                created_by,
+                roles
         """,
         new_user.name,
         new_user.nickname,
@@ -142,30 +99,45 @@ async def create_user(
         new_user_password_hash,
         new_user.phone,
         new_user.cpf,
-        new_user.credit_limit
+        new_user.roles
     )    
 
-    if not row: return None
-    
-    user_id = row['id']
-    current_roles = []
+    return UserResponse(**dict(row)) if row else None
 
-    if new_user.roles:
-        roles_data = [(user_id, role) for role in new_user.roles]        
-        await conn.executemany(
-            """
-                INSERT INTO user_roles (
-                    id,
-                    role
-                )
-                VALUES 
-                    ($1, $2)
-                ON CONFLICT
-                    (id, role)
-                DO NOTHING
-            """,
-            roles_data
-        )
-        current_roles = new_user.roles
-            
-    return UserResponse(**dict(row), roles=current_roles)
+
+async def get_staff_members(conn: Connection, limit: int = 64, offset: int = 0) -> Pagination[UserResponse]:
+    total = await conn.fetchval("SELECT COUNT(*) FROM users WHERE tenant_id = current_user_tenant_id() AND is_active = TRUE")
+    rows = await conn.fetch(
+        """
+            SELECT
+                id,
+                name,
+                tenant_id,
+                nickname,
+                email,
+                notes,
+                state_tax_indicator,
+                created_at,
+                updated_at,
+                created_by,
+                roles
+            FROM
+                users
+            WHERE
+                tenant_id = current_user_tenant_id()
+                AND is_active = TRUE
+            LIMIT
+                $1
+            OFFSET
+                $2
+        """,
+        limit,
+        offset
+    )
+    
+    return Pagination(
+        total=total,
+        limit=limit,
+        offset=offset,
+        results=[UserResponse(**dict(row)) for row in rows]
+    )

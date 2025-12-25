@@ -222,11 +222,16 @@ async def get_log_stats(conn: Connection) -> LogStats:
     
     # Estatísticas por método HTTP
     method_stats = await conn.fetch("""
-        SELECT method, COUNT(*) as count
-        FROM logs
-        WHERE method IS NOT NULL
-        GROUP BY method
-        ORDER BY count DESC
+        SELECT 
+            method, COUNT(*) as count
+        FROM 
+            logs
+        WHERE 
+            method IS NOT NULL
+        GROUP BY 
+            method
+        ORDER BY 
+            count DESC
     """)
     
     # Correção para logs por dia
@@ -257,10 +262,14 @@ async def get_log_stats(conn: Connection) -> LogStats:
             SELECT 
                 path,
                 COUNT(*) as count
-            FROM logs
-            WHERE level = 'ERROR'
-            GROUP BY path
-            ORDER BY count DESC
+            FROM 
+                logs
+            WHERE 
+                level = 'ERROR'
+            GROUP BY 
+                path
+            ORDER BY 
+                count DESC
             LIMIT 10
         """
     )

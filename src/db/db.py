@@ -74,6 +74,11 @@ async def get_db_pool() -> asyncpg.Pool:
     return db.pool
 
 
+async def log_rls(conn: asyncpg.Connection) -> None:
+    row = await conn.fetchrow("SELECT get_session_context_log()")
+    print(row)
+
+
 T = TypeVar("T")
 
 ERROR_MAP = {
@@ -126,8 +131,15 @@ async def _handle_asyncpg_errors(operation: Awaitable[T]) -> T:
         else:
             detail = ERROR_MAP.get(e.constraint_name, "Dados inválidos.")
         raise DatabaseError(code=status.HTTP_400_BAD_REQUEST, detail=detail)
+    except asyncpg.exceptions.NoDataFoundError as e:
+        raise DatabaseError(
+            code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
+            detail=f"{e}", 
+            log_msg=f"{e}"
+        )
+    except HTTPException as e:
+        raise e
     except Exception as e:
-        if isinstance(e, HTTPException): raise e
         raise DatabaseError(
             code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
             detail="Erro interno ao processar operação.", 
@@ -135,11 +147,12 @@ async def _handle_asyncpg_errors(operation: Awaitable[T]) -> T:
         )
 
 
+async def _execute_sequence(operations):
+    return [await op for op in operations]
+
+
 async def db_safe_exec(*operations: Awaitable[T]) -> T | list[T]:
     results = await _handle_asyncpg_errors(_execute_sequence(operations))
     if len(results) == 1: return results[0]
     return results
 
-
-async def _execute_sequence(operations):
-    return [await op for op in operations]

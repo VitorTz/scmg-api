@@ -20,6 +20,8 @@ class Constants:
     
     EXCHANGE_RATE_URL = f"https://api.exchangerate.host/live?access_key={os.getenv("EXCHANGE_RATE_API_KEY")}&currencies=USD,ARS,EUR,UYU,CLP,PYG&format=1&source=BRL"
     CURRENCY_UPDATE_TIME_IN_MINUTES = int(os.getenv("CURRENCY_UPDATE_TIME_IN_MINUTES", 481))
+    
+    NUVEM_FISCAL_API = os.getenv("NUVEM_FISCAL_TOKEN")
 
     MAX_BODY_SIZE = 20 * 1024 * 1024
     MAX_REQUESTS = 120 if os.getenv("ENV", "DEV") == "PROD" else 999_999_999

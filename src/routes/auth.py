@@ -1,15 +1,16 @@
 from fastapi import APIRouter, Depends, status, Response, Cookie
+from fastapi_limiter.depends import RateLimiter
 from src.security import get_postgres_connection, get_rls_connection
 from src.schemas.auth import LoginRequest
 from src.schemas.user import UserResponse
 from src.schemas.rls import RLSConnection
 from src.model import user as user_model
-from src.controller import auth
+from src.services import auth as auth_service
 from typing import Optional
 from asyncpg import Connection
 
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(RateLimiter(times=16, seconds=60))])
 
 
 @router.get(
@@ -32,7 +33,7 @@ async def login(
     refresh_token: Optional[str] = Cookie(default=None),
     conn: Connection = Depends(get_postgres_connection)
 ):    
-    return await auth.login(login_req, refresh_token, response, conn)
+    return await auth_service.login(login_req, refresh_token, response, conn)
 
 
 @router.post(
@@ -45,13 +46,16 @@ async def refresh(
     refresh_token: Optional[str] = Cookie(default=None),
     conn: Connection = Depends(get_postgres_connection)
 ):    
-    return await auth.refresh(refresh_token, response, conn)
+    return await auth_service.refresh(refresh_token, response, conn)
 
 
-@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
+@router.post(
+    "/logout", 
+    status_code=status.HTTP_204_NO_CONTENT
+)
 async def logout(
     response: Response,
     refresh_token: Optional[str] = Cookie(default=None),
     conn: Connection = Depends(get_postgres_connection)
 ):
-    await auth.logout(refresh_token, response, conn)
+    await auth_service.logout(refresh_token, response, conn)

@@ -7,6 +7,7 @@ from src.schemas.rls import RLSConnection
 from src.model import user as user_model
 from src.model import refresh_token as refresh_token_model
 from src.db.db import db_safe_exec, db
+from datetime import datetime, timezone
 from typing import Optional
 from asyncpg import Connection
 from src import security
@@ -32,10 +33,13 @@ async def login(
 ) -> UserResponse:
     
     if refresh_token:
-        await refresh_token_model.revoke_token_family_by_token_id(
-            security.decode_refresh_token(refresh_token).token_id,
-            conn
-        )
+        try:
+            await refresh_token_model.revoke_token_family_by_token_id(
+                security.decode_refresh_token(refresh_token).token_id,
+                conn
+            )
+        except Exception:
+            pass    
         
     data: Optional[LoginData] = await db_safe_exec(user_model.get_login_data(login_req, conn))
     
@@ -76,8 +80,6 @@ async def login(
         roles=data.roles,        
         notes=data.notes,
         state_tax_indicator=data.state_tax_indicator,
-        credit_limit=data.credit_limit,
-        invoice_amount=data.invoice_amount,
         created_at=data.created_at,
         updated_at=data.updated_at,
         tenant_id=data.tenant_id,
@@ -100,9 +102,9 @@ async def refresh(
     
     if not old_token:
         raise INVALID_REFRESH_TOKEN
-        
-    if old_token.revoked:
-        if db.pool:            
+    
+    if old_token.revoked or old_token.expires_at < datetime.now(timezone.utc):
+        if db.pool:
             async with db.pool.acquire() as temp_conn:
                 await refresh_token_model.revoke_token_family(old_token.family_id, temp_conn)
         raise INVALID_REFRESH_TOKEN

@@ -8,11 +8,23 @@
 -- ============================================================================
 
 CREATE SCHEMA IF NOT EXISTS partman;
+CREATE EXTENSION IF NOT EXISTS "unaccent";
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS "pg_trgm";
 CREATE EXTENSION IF NOT EXISTS "citext";
 CREATE EXTENSION IF NOT EXISTS "pg_partman" WITH SCHEMA partman;
 CREATE EXTENSION IF NOT EXISTS "pg_cron";
+
+-- ============================================================================
+-- AUX FUNCTIONS
+-- ============================================================================
+CREATE OR REPLACE FUNCTION public.immutable_unaccent(text)
+  RETURNS text
+  SET search_path = public, extensions, pg_temp
+AS
+$func$
+SELECT extensions.unaccent('extensions.unaccent', $1)
+$func$  LANGUAGE sql IMMUTABLE;
 
 -- ============================================================================
 -- API USER
@@ -227,7 +239,7 @@ END $$;
 
 -- Atualiza automaticamente o campo updated_at quando um registro é modificado
 CREATE OR REPLACE FUNCTION update_updated_at_column()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER SET search_path = public, extensions, pg_temp AS $$
 BEGIN
     NEW.updated_at = CURRENT_TIMESTAMP;
     RETURN NEW;
@@ -237,7 +249,7 @@ $$ language 'plpgsql';
 
 -- Retorna o nível de privilégio de uma role (quanto maior, mais poder)
 CREATE OR REPLACE FUNCTION get_role_privilege_level(role user_role_enum)
-RETURNS INTEGER AS $$
+RETURNS INTEGER SET search_path = public, extensions, pg_temp AS $$
 BEGIN
     RETURN CASE role
         WHEN 'ADMIN' THEN 120
@@ -263,7 +275,7 @@ $$ LANGUAGE plpgsql IMMUTABLE;
 
 -- Retorna o nível máximo de privilégio de um array de roles
 CREATE OR REPLACE FUNCTION get_max_privilege_from_roles(roles user_role_enum[])
-RETURNS INTEGER AS $$
+RETURNS INTEGER SET search_path = public, extensions, pg_temp AS $$
 DECLARE
     role user_role_enum;
     max_level INTEGER := 0;
@@ -279,6 +291,17 @@ BEGIN
     RETURN max_level;
 END;
 $$ LANGUAGE plpgsql IMMUTABLE;
+
+-- ============================================================================
+-- APP TOKENS
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS app_tokens (
+    service_name VARCHAR(50) PRIMARY KEY, -- ex: 'nuvem_fiscal'
+    access_token TEXT NOT NULL,
+    expires_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 
 -- ============================================================================
 -- FISCAL
@@ -318,16 +341,17 @@ DO UPDATE SET
     descr = EXCLUDED.descr;
 
 -- ============================================================================
--- NCM VERSION
+-- IBPT VERSION
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS ibpt_versions (
-    version TEXT PRIMARY KEY,  -- Ex: '24.1.B' (Versão da tabela IBPT)
+    version TEXT PRIMARY KEY,
     valid_from DATE,
     valid_until DATE,
     source TEXT,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
 -- ============================================================================
 -- NCM
 -- ============================================================================
@@ -336,9 +360,7 @@ CREATE TABLE IF NOT EXISTS fiscal_ncms (
     code TEXT NOT NULL,
     uf VARCHAR(2) NOT NULL,
     version TEXT NOT NULL,
-
     description TEXT NOT NULL, -- Descrição oficial (Ex: "Cervejas de malte")
-    
     -- Alíquotas aproximadas (Lei 12.741/2012 - De Olho no Imposto)
     federal_national_rate NUMERIC(5, 2) DEFAULT 0, -- Imposto Federal (Produtos Nacionais)
     federal_import_rate NUMERIC(5, 2) DEFAULT 0,   -- Imposto Federal (Produtos Importados)
@@ -350,22 +372,47 @@ CREATE TABLE IF NOT EXISTS fiscal_ncms (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX IF NOT EXISTS idx_fiscal_ncms_description_trgm ON fiscal_ncms USING GIN (description gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_fiscal_ncms_version ON fiscal_ncms(version);
 CREATE INDEX IF NOT EXISTS idx_fiscal_ncms_uf ON fiscal_ncms(uf);
+CREATE INDEX IF NOT EXISTS idx_fiscal_ncms_code_uf ON fiscal_ncms (uf, code);
+CREATE INDEX IF NOT EXISTS idx_fiscal_ncms_desc_trgm ON fiscal_ncms USING gin (immutable_unaccent(description) gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_fiscal_ncms_code_pattern ON fiscal_ncms (code text_pattern_ops);
 
 -- ============================================================================
 -- CNPJS
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS cnpjs (
-    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    cnpj TEXT NOT NULL,
-    data JSONB NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT companies_unique_cnpj UNIQUE (cnpj)
-);
+    cnpj VARCHAR(14) PRIMARY KEY, -- Apenas números
+    
+    -- Identificação
+    name CITEXT,       -- Razão Social
+    trade_name CITEXT, -- Nome Fantasia
+        
+    -- Tributário
+    is_simples BOOLEAN DEFAULT FALSE, -- Se é optante pelo Simples
+    is_mei BOOLEAN DEFAULT FALSE,     -- Se é MEI
+    cnae_main_code VARCHAR(10),       -- Código da atividade principal
+    cnae_main_desc TEXT,    
 
+    -- Endereço
+    zip_code VARCHAR(8),
+    street TEXT,
+    number VARCHAR(20),
+    complement TEXT,
+    neighborhood TEXT,
+    city_name TEXT,
+    city_code VARCHAR(7),
+    state CHAR(2),
+
+    -- Contato
+    email TEXT,
+    phone TEXT,
+
+    -- raw data
+    raw_source_cnpj JSONB,
+    last_update TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 
 -- ============================================================================
 -- TENANTS
@@ -392,7 +439,7 @@ CREATE TABLE IF NOT EXISTS users (
     name TEXT NOT NULL,
     nickname TEXT,
     birth_date DATE,
-    email TEXT,
+    email CITEXT,
     phone TEXT,
     cpf VARCHAR(14),
     image_url TEXT, -- Foto do funcionário (aparece no PDV) ou do cliente
@@ -427,8 +474,7 @@ CREATE TABLE IF NOT EXISTS users (
 
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE ON UPDATE CASCADE,
     FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE,
-    CONSTRAINT users_email_unique_cstr UNIQUE (email, tenant_id),
-    CONSTRAINT users_cpf_unique_cstr UNIQUE (cpf, tenant_id),
+    CONSTRAINT users_roles_not_empty CHECK (roles IS NOT NULL AND array_length(roles, 1) > 0),
     CONSTRAINT users_valid_cpf_cstr CHECK (cpf IS NULL OR cpf ~ '^\d{11}$'),
     CONSTRAINT users_valid_email_cstr CHECK (email IS NULL OR email ~* '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'),
     CONSTRAINT users_name_length_cstr CHECK (length(name) BETWEEN 2 AND 256),
@@ -439,9 +485,212 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 CREATE INDEX IF NOT EXISTS idx_users_cpf ON users(cpf);
 CREATE INDEX IF NOT EXISTS idx_users_name ON users USING gin(name gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_users_tenant_active ON users(tenant_id, is_active);
-CREATE INDEX IF NOT EXISTS idx_users_privilege_level ON users(tenant_id, max_privilege_level DESC);
-CREATE INDEX IF NOT EXISTS idx_users_roles_gin ON users USING GIN(roles);
+CREATE INDEX IF NOT EXISTS idx_users_tenant ON users(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_users_privilege_level_asc ON users(tenant_id, max_privilege_level ASC);
+CREATE INDEX IF NOT EXISTS idx_users_privilege_level_desc ON users(tenant_id, max_privilege_level DESC) WHERE is_active = TRUE;
+CREATE INDEX IF NOT EXISTS idx_users_roles_btree ON users USING btree(tenant_id, roles);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_unique ON users(email, tenant_id) WHERE email IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_cpf_unique ON users(cpf, tenant_id) WHERE cpf IS NOT NULL;
+
+
+CREATE OR REPLACE FUNCTION guard_users_modification()
+RETURNS TRIGGER SET search_path = public, extensions, pg_temp AS $$
+DECLARE
+    v_my_role_level INTEGER;
+    v_my_id UUID;
+    v_my_tenant UUID;
+    v_is_system_action BOOLEAN;
+BEGIN
+
+    -- Bypass
+    IF SESSION_USER != 'postgres' THEN
+        v_is_system_action := FALSE;
+    ELSE
+        v_is_system_action := COALESCE(
+            NULLIF(current_setting('app.is_system_action', TRUE), ''), 
+            'false'
+        )::BOOLEAN;
+    END IF;
+
+    IF v_is_system_action IS TRUE THEN
+        RETURN NEW;
+    END IF;
+
+    -- Carrega contexto atual (usando suas funções auxiliares)
+    v_my_id := current_user_id();
+
+    IF v_my_id IS NULL THEN
+        RAISE EXCEPTION 'Contexto de sessão inválido. current_user_id() não está configurado.';
+    END IF;
+    
+    v_my_role_level := current_user_max_privilege();
+    v_my_tenant := current_user_tenant_id();
+
+    -- Verifica a integridade das funções do usuário
+    IF NEW.roles IS NULL OR array_length(NEW.roles, 1) = 0 THEN
+        NEW.roles := ARRAY['CLIENTE']::user_role_enum[];
+    END IF;
+
+    -- 1. VALIDAÇÃO DE TENANT (Segurança Suprema)
+    -- Ninguém pode tocar em dados de outro tenant
+    IF (TG_OP = 'INSERT' OR TG_OP = 'UPDATE') THEN
+        IF NEW.tenant_id != v_my_tenant THEN
+            RAISE EXCEPTION 'SECURITY VIOLATION: Tentativa de operação em tenant cruzado (Cross-Tenant).' 
+            USING ERRCODE = 'P0001';
+        END IF;
+    END IF;
+    
+    IF (TG_OP = 'DELETE' OR TG_OP = 'UPDATE') THEN
+        IF OLD.tenant_id != v_my_tenant THEN
+            RAISE EXCEPTION 'SECURITY VIOLATION: Este usuário pertence a outro tenant.' 
+            USING ERRCODE = 'P0001';
+        END IF;
+    END IF;
+
+    -- 2. REGRAS DE INSERT
+    IF (TG_OP = 'INSERT') THEN
+        -- Regra: Cliente (0) só pode ser criado por quem tem privilégio > 0
+        IF NEW.max_privilege_level = 0 THEN
+            IF v_my_role_level <= 0 THEN
+                RAISE EXCEPTION 'PERMISSÃO NEGADA: Clientes não podem criar outros clientes.'
+                USING ERRCODE = 'P0002';
+            END IF;
+        ELSE
+            -- Regra: Para criar Staff, preciso ter 70+ E ser superior ao criado
+            IF v_my_role_level < 70 THEN
+                RAISE EXCEPTION 'PERMISSÃO NEGADA: Apenas Gestores (70+) podem criar Staff.'
+                USING ERRCODE = 'P0002';
+            END IF;
+            
+            IF v_my_role_level < NEW.max_privilege_level THEN
+                RAISE EXCEPTION 'HIERARQUIA: Você (Nível %) não pode criar alguém com nível superior ao seu (Nível %).', v_my_role_level, NEW.max_privilege_level
+                USING ERRCODE = 'P0002';
+            END IF;
+        END IF;
+    END IF;
+
+    -- 3. REGRAS DE UPDATE
+    IF (TG_OP = 'UPDATE') THEN
+        -- Permite atualizar a si mesmo (ex: mudar senha/foto)
+        IF OLD.id = v_my_id THEN
+            -- Mas não pode subir o próprio cargo!
+            IF NEW.max_privilege_level > v_my_role_level THEN
+                 RAISE EXCEPTION 'FRAUDE: Você não pode aumentar seu próprio nível de privilégio.'
+                 USING ERRCODE = 'P0003';
+            END IF;
+            RETURN NEW; -- Se for ele mesmo e não subiu cargo, libera.
+        END IF;
+
+        -- Se não sou eu, preciso ser chefe (70+)
+        IF v_my_role_level < 70 THEN
+            RAISE EXCEPTION 'PERMISSÃO NEGADA: Apenas Gestores podem editar outros usuários.'
+            USING ERRCODE = 'P0002';
+        END IF;
+
+        -- E o alvo deve ser inferior ou igual
+        IF v_my_role_level < OLD.max_privilege_level THEN
+             RAISE EXCEPTION 'HIERARQUIA: Você não pode editar um usuário com patente superior à sua.'
+             USING ERRCODE = 'P0002';
+        END IF;
+        
+        -- E não posso promover ele acima de mim
+        IF v_my_role_level < NEW.max_privilege_level THEN
+             RAISE EXCEPTION 'HIERARQUIA: Você não pode promover alguém para um nível acima do seu.'
+             USING ERRCODE = 'P0002';
+        END IF;
+    END IF;
+
+    -- 4. REGRAS DE DELETE
+    IF (TG_OP = 'DELETE') THEN
+        IF OLD.id = v_my_id THEN
+            RAISE EXCEPTION 'SUICÍDIO DE DADOS: Você não pode deletar sua própria conta. Contate um superior.'
+            USING ERRCODE = 'P0004';
+        END IF;
+
+        IF v_my_role_level < 92 THEN
+             RAISE EXCEPTION 'PERMISSÃO NEGADA: Apenas Admins (92+) podem deletar usuários.'
+             USING ERRCODE = 'P0002';
+        END IF;
+
+        IF v_my_role_level < OLD.max_privilege_level THEN
+             RAISE EXCEPTION 'HIERARQUIA: Você não pode deletar um superior.'
+             USING ERRCODE = 'P0002';
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE TRIGGER trg_guard_users_modification
+BEFORE INSERT OR UPDATE OR DELETE ON users
+FOR EACH ROW EXECUTE FUNCTION guard_users_modification();
+
+
+CREATE OR REPLACE FUNCTION update_last_login_safe(p_user_id UUID)
+RETURNS VOID SET search_path = public, extensions, pg_temp AS $$
+BEGIN
+
+    PERFORM set_config('app.is_system_action', 'true', true);
+    
+    UPDATE 
+        users 
+    SET 
+        last_login_at = CURRENT_TIMESTAMP
+    WHERE 
+        id = p_user_id;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+
+CREATE OR REPLACE FUNCTION get_user_login_data(p_identifier TEXT)
+RETURNS TABLE (
+    id UUID,
+    name TEXT,
+    nickname TEXT,
+    email TEXT,
+    password_hash TEXT,
+    notes TEXT,
+    state_tax_indicator TEXT,
+    created_at TIMESTAMPTZ,
+    created_by UUID,
+    updated_at TIMESTAMPTZ,
+    tenant_id UUID,
+    roles TEXT[]
+) SET search_path = public, extensions, pg_temp AS $$
+DECLARE
+    v_clean_input TEXT;
+    v_is_email BOOLEAN;
+BEGIN
+    v_clean_input := TRIM(p_identifier);    
+    v_is_email := (v_clean_input LIKE '%@%');
+
+    RETURN QUERY
+    SELECT 
+        u.id,
+        u.name,
+        u.nickname,
+        u.email::TEXT,
+        u.password_hash,
+        u.notes,
+        u.state_tax_indicator::TEXT,
+        u.created_at::TIMESTAMPTZ,
+        u.created_by,
+        u.updated_at::TIMESTAMPTZ,
+        u.tenant_id,
+        u.roles::TEXT[]
+    FROM 
+        users u
+    WHERE
+        CASE 
+            WHEN v_is_email THEN
+                u.email = v_clean_input
+            ELSE
+                u.cpf = regexp_replace(v_clean_input, '\D','','g')
+        END
+    LIMIT 1;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
 
 -- ============================================================================
 -- CATEGORIES
@@ -477,9 +726,7 @@ CREATE TABLE IF NOT EXISTS categories (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
-    CONSTRAINT categories_name_length_cstr CHECK (length(name) BETWEEN 2 AND 100),
-    -- Garante unicidade do nome DENTRO do mesmo nível hierárquico e tenant
-    -- (Permite ter 'Bebidas' dentro de 'Loja A' e 'Bebidas' dentro de 'Loja B')
+    CONSTRAINT categories_name_length_cstr CHECK (length(name) BETWEEN 2 AND 100),    
     CONSTRAINT categories_unique_name_tenant_parent UNIQUE (tenant_id, parent_id, name),    
     CONSTRAINT categories_no_self_parent CHECK (id <> parent_id),    
     FOREIGN KEY (parent_id) REFERENCES categories(id) ON DELETE SET NULL ON UPDATE CASCADE,
@@ -500,7 +747,7 @@ RETURNS TABLE (
     parent_id UUID,
     level INTEGER,
     path TEXT
-) AS $$
+) SET search_path = public, extensions, pg_temp AS $$
 BEGIN
     RETURN QUERY
     WITH RECURSIVE category_tree AS (
@@ -544,25 +791,61 @@ $$ LANGUAGE plpgsql STABLE;
 -- SUPPLIERS - Cadastro de fornecedores de produtos
 -- ============================================================================
 
+
 CREATE TABLE IF NOT EXISTS suppliers (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    name CITEXT NOT NULL,
-    cnpj TEXT,
-    phone TEXT,
-    contact_name TEXT,
-    address TEXT,
+    
+    -- Identificação
+    name CITEXT NOT NULL, -- Razão Social
+    trade_name CITEXT,    -- Nome Fantasia (Como eles são conhecidos)
+    
+    -- Fiscal
+    cnpj VARCHAR(14),     -- Apenas números
+    cpf VARCHAR(11),      -- Para Produtor Rural
+    ie VARCHAR(20),       -- Inscrição Estadual (CRUCIAL para NFe)
+    im VARCHAR(20),       -- Inscrição Municipal (Serviços)
+    
+    -- Contato
+    email CITEXT,
+    phone VARCHAR(20),    -- Aceite formatação "(48) 9..."
+    contact_name TEXT,    -- Com quem falar (Vendedor)
+    website TEXT,
+    
+    -- Endereço Estruturado
+    zip_code VARCHAR(8),  -- CEP (Apenas números)
+    address TEXT,         -- Logradouro (Rua, Av, etc)
+    number VARCHAR(20),   -- Pode ser "S/N", "KM 10", "123B"
+    complement TEXT,      -- "Galpão 2", "Sala 304"
+    neighborhood TEXT,    -- Bairro
+    city_name TEXT,       -- Nome da Cidade (Visual)
+    city_code VARCHAR(7), -- Código IBGE (Obrigatório para o XML da NFe)
+    state CHAR(2),        -- UF (SC, PR, SP...)
+    
+    -- Operacional
+    notes TEXT,           -- "Só entrega na terça", "Chamar no WhatsApp"
+    lead_time INTEGER,    -- Tempo médio de entrega em dias (Ajuda no pedido de compra)
+    
+    -- Auditoria
     tenant_id UUID NOT NULL,
     created_by UUID,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT suppliers_cnpj_length_check CHECK ((length(cnpj) <= 20)),
-    CONSTRAINT suppliers_phone_length_check CHECK ((length(phone) = 11)),
-    CONSTRAINT suppliers_cnpj_unique UNIQUE (cnpj, tenant_id),
-    CONSTRAINT suppliers_name_unique UNIQUE (name, tenant_id),
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    -- Relacionamentos
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE ON UPDATE CASCADE,
-    FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE
+    FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE,
+    
+    -- 1. Garante que tem pelo menos UM documento (CPF ou CNPJ)
+    CONSTRAINT suppliers_doc_check CHECK (cnpj IS NOT NULL OR cpf IS NOT NULL),
+    
+    -- 2. Unicidade por Tenant (Evita duplicar o fornecedor da Coca-Cola)
+    CONSTRAINT suppliers_cnpj_unique UNIQUE (cnpj, tenant_id),
+    CONSTRAINT suppliers_cpf_unique UNIQUE (cpf, tenant_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_suppliers_tenant_id ON suppliers(tenant_id);
+-- Índices para busca rápida no PDV
+CREATE INDEX IF NOT EXISTS idx_suppliers_tenant_name ON suppliers(tenant_id, name);
+CREATE INDEX IF NOT EXISTS idx_suppliers_trade_name ON suppliers(tenant_id, trade_name);
 
 -- ============================================================================
 -- TRIBUTAÇÃO
@@ -590,7 +873,7 @@ CREATE INDEX IF NOT EXISTS idx_tax_groups_tenant_id ON tax_groups(tenant_id);
 
 CREATE TABLE IF NOT EXISTS products (    
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    sku CITEXT, -- Pode ser nulo para produtos internos/modificadores
+    sku CITEXT NOT NULL,
     name CITEXT NOT NULL,
     description TEXT,
     image_url TEXT,
@@ -680,9 +963,69 @@ CREATE INDEX IF NOT EXISTS idx_products_search ON products USING GIN(search_vect
 CREATE INDEX IF NOT EXISTS idx_products_fts ON products USING GIN(to_tsvector('portuguese', name || ' ' || description));
 CREATE INDEX IF NOT EXISTS idx_products_negative_stock ON products(tenant_id, stock_quantity) WHERE stock_quantity < 0;
 
+
+CREATE OR REPLACE FUNCTION generate_numeric_sku(p_digits INT DEFAULT 5)
+RETURNS TEXT SET search_path = public, extensions, pg_temp AS $$
+DECLARE
+    v_min BIGINT;
+    v_max BIGINT;
+BEGIN
+    
+    IF p_digits < 2 OR p_digits > 18 THEN
+        p_digits := 6;
+    END IF;
+
+    v_min := power(10, p_digits - 1)::BIGINT;
+    v_max := (power(10, p_digits)::BIGINT) - 1;
+
+    RETURN floor(random() * (v_max - v_min + 1) + v_min)::text;
+END;
+$$ LANGUAGE plpgsql VOLATILE;
+
+
+CREATE OR REPLACE FUNCTION ensure_unique_sku()
+RETURNS TRIGGER SET search_path = public, extensions, pg_temp AS $$
+DECLARE
+    v_candidate TEXT;
+    v_max_attempts INTEGER := 12;
+    v_attempt INTEGER := 0;
+BEGIN
+    
+    IF NEW.sku IS NOT NULL THEN
+        RETURN NEW;
+    END IF;
+    
+    LOOP
+        v_attempt := v_attempt + 1;
+        
+        v_candidate := generate_numeric_sku();
+                
+        IF NOT EXISTS (
+            SELECT 1 FROM products 
+            WHERE tenant_id = NEW.tenant_id 
+            AND sku = v_candidate
+        ) THEN
+            NEW.sku := v_candidate;
+            RETURN NEW;
+        END IF;
+        
+        IF v_attempt >= v_max_attempts THEN
+            RAISE EXCEPTION 'Não foi possível gerar um SKU único após % tentativas. O universo de códigos está saturado?', v_max_attempts;
+        END IF;
+    END LOOP;
+END;
+$$ LANGUAGE plpgsql;
+
+
+CREATE OR REPLACE TRIGGER trg_products_auto_sku
+BEFORE INSERT ON products
+FOR EACH ROW
+EXECUTE FUNCTION ensure_unique_sku();
+
+
 -- MELHORAR TRIGGER DE AUDITORIA DE PREÇOS:
 CREATE OR REPLACE FUNCTION fn_audit_price_changes()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER SET search_path = public, extensions, pg_temp AS $$
 BEGIN
     IF TG_OP = 'UPDATE' AND (
         OLD.sale_price != NEW.sale_price OR
@@ -726,7 +1069,9 @@ RETURNS TABLE (
     stock_quantity NUMERIC,
     sale_price NUMERIC,
     relevance NUMERIC
-) AS $$
+) 
+SET search_path = public, extensions, pg_temp
+AS $$
 DECLARE
     v_tenant_id UUID;
 BEGIN
@@ -997,7 +1342,7 @@ ALTER TABLE stock_movements SET (
 
 
 CREATE OR REPLACE FUNCTION fn_update_stock_balance()
-RETURNS TRIGGER SECURITY DEFINER AS $$
+RETURNS TRIGGER SECURITY DEFINER SET search_path = public, extensions, pg_temp AS $$
 DECLARE
     movement_multiplier INTEGER;
 BEGIN
@@ -1085,7 +1430,7 @@ CREATE OR REPLACE FUNCTION get_next_fiscal_number(
     p_series INTEGER,
     p_model VARCHAR
 ) 
-RETURNS INTEGER AS $$
+RETURNS INTEGER SET search_path = public, extensions, pg_temp AS $$
 DECLARE
     v_new_number INTEGER;
 BEGIN
@@ -1168,7 +1513,7 @@ CREATE INDEX IF NOT EXISTS idx_sales_date_range ON sales(tenant_id, created_at);
 
 -- [PARA GERENCIAR CANCELAMENTO DE VENDA]
 CREATE OR REPLACE FUNCTION fn_handle_sale_cancellation()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER SET search_path = public, extensions, pg_temp AS $$
 BEGIN
     -- Só age se mudou de QUALQUER status para 'CANCELADA'
     IF NEW.status = 'CANCELADA' AND OLD.status != 'CANCELADA' THEN        
@@ -1223,7 +1568,7 @@ FOR EACH ROW EXECUTE FUNCTION fn_handle_sale_cancellation();
 
 
 CREATE OR REPLACE FUNCTION fn_validate_sale_totals()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER SET search_path = public, extensions, pg_temp AS $$
 DECLARE
     v_items_sum NUMERIC(15,2);
     v_calc_total NUMERIC(15,2);
@@ -1257,7 +1602,7 @@ EXECUTE FUNCTION fn_validate_sale_totals();
 
 
 CREATE OR REPLACE FUNCTION fn_assign_fiscal_number()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER SET search_path = public, extensions, pg_temp AS $$
 BEGIN
     -- Só age se a venda está sendo CONCLUÍDA e ainda não tem número
     IF NEW.status = 'CONCLUIDA' AND (OLD.status IS DISTINCT FROM 'CONCLUIDA') THEN
@@ -1366,7 +1711,7 @@ CREATE INDEX IF NOT EXISTS idx_sale_payments_sale_id ON sale_payments(tenant_id,
 
 
 CREATE OR REPLACE FUNCTION check_payment_total()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER SET search_path = public, extensions, pg_temp AS $$
 DECLARE
     v_sale_total NUMERIC;
     v_total_paid NUMERIC;
@@ -1468,8 +1813,9 @@ CREATE INDEX IF NOT EXISTS idx_currencies_created_at_desc ON currencies(created_
 -- ============================================================================
 
 -- Tabela de auditoria de operações sensíveis
+
 CREATE TABLE IF NOT EXISTS security_audit_log (
-    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    id BIGINT GENERATED ALWAYS AS IDENTITY,
     user_id UUID,
     tenant_id UUID,
     operation TEXT NOT NULL,
@@ -1478,9 +1824,10 @@ CREATE TABLE IF NOT EXISTS security_audit_log (
     old_values JSONB,
     new_values JSONB,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id, created_at),
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE,
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE SET NULL ON UPDATE CASCADE
-);
+) PARTITION BY RANGE (created_at);
 
 CREATE INDEX IF NOT EXISTS idx_audit_record_trace ON security_audit_log (table_name, record_id);
 CREATE INDEX IF NOT EXISTS idx_audit_user ON security_audit_log (user_id);

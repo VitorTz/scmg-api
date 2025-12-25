@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, status
+from fastapi_limiter.depends import RateLimiter
 from src.schemas.user_feedback import UserFeedbackCreate
 from asyncpg import Connection
 from src.model import user_feedback as user_feedback_model
@@ -6,7 +7,7 @@ from src.security import get_postgres_connection
 from src.db.db import db_safe_exec
 
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(RateLimiter(times=16, seconds=60))])
 
 
 @router.post("/", status_code=status.HTTP_204_NO_CONTENT)

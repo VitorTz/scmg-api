@@ -99,7 +99,7 @@ def create_refresh_token(
     expires_at = datetime.now(timezone.utc) + timedelta(days=Constants.REFRESH_TOKEN_EXPIRE_DAYS)
     
     payload = {
-        "sub": token_id,
+        "sub": str(token_id),
         "exp": expires_at,
         "type": "refresh"
     }
@@ -193,12 +193,11 @@ async def get_rls_connection(
                            set_config('app.current_user_tenant_id', $3::text, true),
                            set_config('app.current_user_max_privilege', $4::text, true)
                     """,
-                    row['id'],
-                    row['roles'],
-                    row['tenant_id'],
-                    row['max_privilege_level']
+                    str(row['id']),
+                    "{" + ",".join(row['roles']) + "}",
+                    str(row['tenant_id']),
+                    str(row['max_privilege_level'])
                 )
-                
             except Exception as e:
                 print(f"[CRITICAL] Erro ao configurar sessão RLS: {e}")
                 raise DatabaseError(code=500, detail="Security context failure.")
@@ -207,15 +206,8 @@ async def get_rls_connection(
 
 
 async def get_postgres_connection(pool: Pool = Depends(get_db_pool)):
-    """
-        Retorna uma conexão com o usuário postgres (super usuário)
-    """
     async with pool.acquire() as connection:
-        async with connection.transaction():
-            try:
-                yield connection
-            except Exception as e:
-                raise e
+        yield connection
 
 
 def set_session_token_cookie(
