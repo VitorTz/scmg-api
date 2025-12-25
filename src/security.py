@@ -1,8 +1,8 @@
-from fastapi import Depends, HTTPException, status, Cookie, Response, Header
-from datetime import datetime, timedelta, timezone
 from src.schemas.token import AccessTokenCreate, RefreshTokenCreate, DecodedRefreshToken, DecodedAccessToken
 from src.schemas.rls import RLSConnection, AdminConnectionWithUser
 from src.schemas.user import UserResponse
+from fastapi import Depends, HTTPException, status, Cookie, Response
+from datetime import datetime, timedelta, timezone
 from src.constants import Constants
 from passlib.context import CryptContext
 from src.exceptions import DatabaseError
@@ -61,14 +61,6 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     except Exception:
         return False
     
-
-def sha256_encode(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-
-def sha256_verify(value: str, encoded_value) -> str:
-    return sha256_encode(value) == encoded_value
-
 
 def create_access_token(user_id: uuid.UUID | str) -> AccessTokenCreate:
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=Constants.ACCESS_TOKEN_EXPIRE_MINUTES)

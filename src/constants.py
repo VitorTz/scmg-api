@@ -6,8 +6,8 @@ load_dotenv()
 
 class Constants:
 
-    API_NAME = "SCMG - Market Gestor - API"
-    API_VERSION = "1.0.0"
+    API_NAME = os.getenv("API_NAME")
+    API_VERSION = os.getenv("API_VERSION")
     API_DESCR =  "API para gerenciamento de pequenos e médios comércios"
 
     IS_PRODUCTION = os.getenv("ENV", "DEV").lower().upper() == "PROD"
@@ -28,14 +28,12 @@ class Constants:
     WINDOW = 30
 
     PERMISSIONS_POLICY_HEADER = (
-        "geolocation=(), "
-        "microphone=(), "
-        "camera=(), "
-        "payment=(), "
-        "usb=(), "
-        "magnetometer=(), "
-        "gyroscope=(), "
-        "accelerometer=()"
+        "camera=(), "           # Bloqueia câmera (ajuste se usar scanner)
+        "microphone=(), "       # Bloqueia microfone
+        "geolocation=(), "      # Bloqueia geolocalização (ajuste se precisa)
+        "payment=(self), "      # Permite pagamentos apenas no seu domínio
+        "usb=(), "              # Bloqueia USB
+        "interest-cohort=()"    # Bloqueia FLoC (privacidade)
     )
     
     SENSITIVE_PATHS = ["/auth/", "/admin/"]

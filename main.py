@@ -22,7 +22,6 @@ from src.routes import logs
 from src.model import log as log_model
 from src.db.db import db
 from src.services.redis_client import RedisService
-from src import middleware
 import uvicorn
 import contextlib
 import asyncio
@@ -124,37 +123,83 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
 @app.middleware("http")
-async def http_middleware(request: Request, call_next):
+async def security_middleware(request: Request, call_next):
     start_time = time.perf_counter()
     
-    # Body size check
+    # 1. Body size check (otimizado)
     content_length = request.headers.get("content-length")
     if content_length:
         if int(content_length) > Constants.MAX_BODY_SIZE:
             raise HTTPException(
                 status_code=413,
-                detail=f"Request entity too large. Max allowed: {Constants.MAX_BODY_SIZE} bytes"
+                detail=f"Request too large. Max: {Constants.MAX_BODY_SIZE} bytes"
             )
     else:
-        body = b""
+        # Streaming check (otimizado)
+        chunks = []
+        total_size = 0
         async for chunk in request.stream():
-            body += chunk
-            if len(body) > Constants.MAX_BODY_SIZE:
+            chunks.append(chunk)
+            total_size += len(chunk)
+            if total_size > Constants.MAX_BODY_SIZE:
                 raise HTTPException(
                     status_code=413,
-                    detail=f"Request entity too large. Max allowed: {Constants.MAX_BODY_SIZE} bytes"
+                    detail=f"Request too large. Max: {Constants.MAX_BODY_SIZE} bytes"
                 )
-        request._body = body
+        request._body = b"".join(chunks)
     
-    response: Response = await call_next(request)        
-    middleware.add_security_headers(request, response)
+    # 2. Process request
+    response: Response = await call_next(request)
     
-    # System Monitor
-    response_time_ms = (time.perf_counter() - start_time) * 1000    
-    get_monitor().increment_request(response_time_ms)
-
+    # 3. Security headers (sempre aplicar)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    
+    # 4. HSTS (apenas em produção com HTTPS)
+    if request.url.scheme == "https":
+        response.headers["Strict-Transport-Security"] = (
+            "max-age=31536000; includeSubDomains"
+        )
+    
+    # 5. Frame protection (ajustar conforme necessidade)    
+    response.headers["X-Frame-Options"] = "DENY"
+    
+    # 6. Permissions Policy (ajustar para PDV)
+    response.headers["Permissions-Policy"] = (
+        "camera=(self), "        # Permitir câmera para scanner
+        "geolocation=(self), "   # Permitir localização se necessário
+        "microphone=(), "
+        "payment=(self), "
+        "usb=(), "
+        "interest-cohort=()"
+    )
+        
+    if response.headers.get("content-type", "").startswith("text/html"):
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: https:; "
+            "font-src 'self' data:; "
+            "connect-src 'self'; "
+            "frame-ancestors 'none'; "
+            "base-uri 'self'; "
+            "form-action 'self';"
+        )
+    else:
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'none'; "
+            "frame-ancestors 'none';"
+        )
+    
+    if not request.url.path.startswith("/api/v1/admin"):
+        response_time_ms = (time.perf_counter() - start_time) * 1000
+        get_monitor().increment_request(response_time_ms)
+        
+        if response.status_code >= 400:
+            get_monitor().increment_error()
+    
     return response
-
 
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(request: Request, exc: StarletteHTTPException):

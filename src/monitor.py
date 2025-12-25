@@ -428,7 +428,6 @@ _monitor_instance: Optional[SystemMonitor] = None
 
 
 def get_monitor() -> SystemMonitor:
-    """Retorna instância singleton do monitor"""
     global _monitor_instance
     if _monitor_instance is None:
         _monitor_instance = SystemMonitor()
