@@ -26,7 +26,7 @@ def execute_sql_file(path: Path, cur: psycopg.Cursor) -> None:
 
 
 def main() -> None:
-    db_url = os.getenv("DATABASE_URL")
+    db_url = os.getenv("DATABASE_URL_POSTGRES")
     if not db_url:
         print("Erro: DATABASE_URL não definida.")
         return

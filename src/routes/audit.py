@@ -3,9 +3,11 @@ from fastapi import APIRouter, Depends, Query
 from fastapi.exceptions import HTTPException
 from datetime import datetime
 from fastapi.responses import StreamingResponse
-from src.security import get_postgres_connection
+from src.security import get_rls_connection
+from src.schemas.rls import RLSConnection
 from asyncpg import Connection
 from uuid import UUID
+import orjson
 import csv
 import io
 import json
@@ -23,30 +25,30 @@ def fast_serializer(obj: Any) -> Any:
 
 
 async def json_generator(sql: str, conn: Connection):
-    yield "["
+    yield b"["
     
     is_first = True
         
     async with conn.transaction():
         async for row in conn.cursor(sql):                
             if not is_first:
-                yield ","
+                yield b","
             else:
-                is_first = False
-                            
+                is_first = False            
+
             row_dict = dict(row)
-                            
+                        
             if isinstance(row_dict.get('old_values'), str):
-                    row_dict['old_values'] = json.loads(row_dict['old_values'])
-            if isinstance(row_dict.get('new_values'), str):
-                    row_dict['new_values'] = json.loads(row_dict['new_values'])
-
-
-            chunk = json.dumps(row_dict, default=fast_serializer)
+                row_dict['old_values'] = orjson.loads(row_dict['old_values'])
             
+            if isinstance(row_dict.get('new_values'), str):
+                row_dict['new_values'] = orjson.loads(row_dict['new_values'])
+            
+            chunk = orjson.dumps(row_dict, default=str)
+                        
             yield chunk
-    
-    yield "]"
+        
+    yield b"]"
         
 
 @router.get(
@@ -56,7 +58,7 @@ async def json_generator(sql: str, conn: Connection):
 async def get_audit_logs(
     format: Literal['csv', 'json'] = Query(default='json', description="Formato de saída: 'json' ou 'csv'"),
     days: int = Query(default=15, ge=1, le=365),
-    conn: Connection = Depends(get_postgres_connection)
+    rls: RLSConnection = Depends(get_rls_connection)
 ):
     if not isinstance(days, int):
         raise HTTPException(detail="Inválida configuração de dias.", status_code=422)
@@ -91,8 +93,8 @@ async def get_audit_logs(
             output.seek(0)
             output.truncate(0)
             
-            async with conn.transaction():
-                async for row in conn.cursor(sql):
+            async with rls.conn.transaction():
+                async for row in rls.conn.cursor(sql):
                     old_v = json.dumps(row['old_values'], ensure_ascii=False) if row['old_values'] else ""
                     new_v = json.dumps(row['new_values'], ensure_ascii=False) if row['new_values'] else ""
                     
@@ -119,6 +121,6 @@ async def get_audit_logs(
         )
 
     return StreamingResponse(
-        json_generator(sql, conn),
+        json_generator(sql, rls.conn),
         media_type="application/json"
     )

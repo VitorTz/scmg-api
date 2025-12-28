@@ -13,7 +13,7 @@ def clean_cnpj(cnpj: str) -> str:
 
 
 def create_tenant():
-    db_url = os.getenv("DATABASE_URL")
+    db_url = os.getenv("DATABASE_URL_POSTGRES")
     if not db_url:
         print("Erro: DATABASE_URL não definida.")
         return

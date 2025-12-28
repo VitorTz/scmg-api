@@ -1,12 +1,13 @@
-from asyncpg import Connection, Record
+from asyncpg import Connection
 from src.schemas.user import UserResponse
+from src.schemas.token import DecodedAccessToken
 from typing import Optional
  
 
 
 class RLSConnection:
     
-    def __init__(self, user: Record, conn: Connection):
+    def __init__(self, user: DecodedAccessToken, conn: Connection):
         self.user = user
         self.conn = conn
 

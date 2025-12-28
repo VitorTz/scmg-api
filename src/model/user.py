@@ -12,17 +12,23 @@ async def get_login_data(login: LoginRequest, conn: Connection) -> Optional[Logi
 
 
 async def update_user_last_login(user_id: str | UUID, conn: Connection) -> None:
-    await conn.execute(
-        """
-            UPDATE 
-                users 
-            SET 
-                last_login_at = CURRENT_TIMESTAMP
-            WHERE 
-                id = $1
-        """,
-        user_id
-    )
+    print("oi")
+    try:
+        await conn.execute(
+            """
+                UPDATE 
+                    users
+                SET 
+                    last_login_at = CURRENT_TIMESTAMP
+                WHERE 
+                    id = $1
+            """,
+            user_id
+        )
+    except Exception as e:
+        print(e)
+        raise e
+    print("oi1")
 
 
 async def get_user_by_id(id: str | UUID, conn: Connection) -> UserResponse:

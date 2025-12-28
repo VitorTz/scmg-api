@@ -5,6 +5,8 @@ from datetime import datetime
 from src.services.admin_auth import AdminAPIKeyAuth
 from src.model import log as log_model
 from src.security import get_postgres_connection
+from asyncpg import Connection
+import json
 
 
 api_key_auth = AdminAPIKeyAuth()
@@ -17,6 +19,13 @@ router = APIRouter(
         403: {"description": "API Key inválida"}
     }
 )
+
+@router.get("/db")
+async def get_db_info(conn: Connection = Depends(get_postgres_connection)):
+    raw_json = await conn.fetchval("SELECT get_database_health_check()")    
+    if raw_json:
+        return json.loads(raw_json)
+    return {}
 
 
 @router.get(

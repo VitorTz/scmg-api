@@ -1,6 +1,7 @@
 from fastapi import status
 from fastapi.exceptions import HTTPException
 from dotenv import load_dotenv
+from getpass import getpass
 from passlib.context import CryptContext
 import psycopg
 import os
@@ -34,7 +35,7 @@ def hash_password(password: str) -> str:
 
 
 def create_superuser():
-    db_url = os.getenv("DATABASE_URL")
+    db_url = os.getenv("DATABASE_URL_POSTGRES")
     if not db_url:
         print("Erro: DATABASE_URL não definida.")
         return
@@ -46,7 +47,7 @@ def create_superuser():
         email = input("Email: ").strip()
         phone = remove_non_numbers(input("Telefone (apenas números): "))
         cpf = remove_non_numbers(input("CPF (apenas números): "))
-        raw_password = input("Senha: ").strip()
+        raw_password = getpass("Senha: ").strip()
         tenant_id_str = input("Tenant UUID: ").strip()
 
         # Validação básica pré-banco

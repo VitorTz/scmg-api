@@ -62,8 +62,7 @@ async def revoke_token_family_by_token_id(token_id: UUID, conn: Connection):
         UPDATE 
             refresh_tokens
         SET
-            revoked = TRUE,
-            updated_at = NOW() -- É sempre bom atualizar o timestamp
+            revoked = TRUE
         WHERE
             family_id = (
                 SELECT 
@@ -76,6 +75,19 @@ async def revoke_token_family_by_token_id(token_id: UUID, conn: Connection):
             AND revoked = FALSE
         """,
         token_id
+    )
+    
+async def revoke_token_by_user_id(user_id: UUID, conn: Connection):    
+    await conn.execute(
+        """
+        UPDATE 
+            refresh_tokens
+        SET
+            revoked = TRUE
+        WHERE
+            user_id = $1
+        """,
+        user_id
     )
     
     

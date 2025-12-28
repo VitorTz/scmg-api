@@ -19,7 +19,7 @@ router = APIRouter(dependencies=[Depends(RateLimiter(times=16, seconds=60))])
     response_model=UserResponse
 )
 async def get_me(rls: RLSConnection = Depends(get_rls_connection)):
-    return await user_model.get_user_by_id(rls.user['id'], rls.conn)
+    return await user_model.get_user_by_id(rls.user.user_id, rls.conn)
 
 
 @router.post(
@@ -55,7 +55,6 @@ async def refresh(
 )
 async def logout(
     response: Response,
-    refresh_token: Optional[str] = Cookie(default=None),
-    conn: Connection = Depends(get_postgres_connection)
+    rls: RLSConnection = Depends(get_rls_connection)
 ):
-    await auth_service.logout(refresh_token, response, conn)
+    await auth_service.logout(rls.user, response, rls.conn)

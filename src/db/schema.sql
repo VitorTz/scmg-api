@@ -7,13 +7,12 @@
 -- EXTENSIONS
 -- ============================================================================
 
-CREATE SCHEMA IF NOT EXISTS partman;
+
+CREATE EXTENSION IF NOT EXISTS pg_cron;
 CREATE EXTENSION IF NOT EXISTS "unaccent";
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS "pg_trgm";
 CREATE EXTENSION IF NOT EXISTS "citext";
-CREATE EXTENSION IF NOT EXISTS "pg_partman" WITH SCHEMA partman;
-CREATE EXTENSION IF NOT EXISTS "pg_cron";
 
 -- ============================================================================
 -- AUX FUNCTIONS
@@ -23,8 +22,105 @@ CREATE OR REPLACE FUNCTION public.immutable_unaccent(text)
   SET search_path = public, extensions, pg_temp
 AS
 $func$
-SELECT extensions.unaccent('extensions.unaccent', $1)
+SELECT unaccent('unaccent', $1)
 $func$  LANGUAGE sql IMMUTABLE;
+
+
+CREATE OR REPLACE FUNCTION get_database_health_check()
+RETURNS JSONB 
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+    v_result JSONB;
+    v_role_info RECORD;
+    v_db_size TEXT;
+    v_conn_count INT;
+    v_conn_total INT;
+    v_cache_hit_ratio NUMERIC;
+BEGIN
+    -- 1. Coleta informações da Role atual
+    SELECT 
+        rolsuper, 
+        rolcreaterole, 
+        rolcreatedb, 
+        rolcanlogin, 
+        rolreplication,
+        rolbypassrls
+    INTO v_role_info
+    FROM pg_roles 
+    WHERE rolname = session_user; -- session_user é quem logou de verdade
+
+    -- 2. Coleta tamanho do banco (Formatado, ex: "150 MB")
+    v_db_size := pg_size_pretty(pg_database_size(current_database()));
+
+    -- 3. Coleta conexões ativas neste banco específico
+    SELECT count(*) INTO v_conn_count 
+    FROM pg_stat_activity 
+    WHERE datname = current_database();
+
+    -- 4. Cálculo simples de Cache Hit Ratio (Eficiência da memória RAM)
+    -- Se for > 99%, seu banco está voando. Se for < 90%, precisa de mais RAM.
+    SELECT 
+        ROUND(
+            (sum(heap_blks_hit) / (sum(heap_blks_hit) + sum(heap_blks_read) + 1)) * 100.0, 
+            2
+        )
+    INTO v_cache_hit_ratio
+    FROM pg_statio_user_tables;
+
+    -- Monta o JSON final
+    v_result := jsonb_build_object(
+        'timestamp', now(),
+        'session_context', jsonb_build_object(
+            'database', current_database(),
+            'schema_search_path', current_setting('search_path'),
+            'connected_via_port', current_setting('port'),
+            'server_address', inet_server_addr()
+        ),
+        'user_identity', jsonb_build_object(
+            'session_user', session_user, -- Quem digitou a senha
+            'current_user', current_user, -- Quem está executando agora (muda em SECURITY DEFINER)
+            'is_superuser', v_role_info.rolsuper,
+            'has_bypass_rls', v_role_info.rolbypassrls, -- CRUCIAL para seus testes
+            'can_create_db', v_role_info.rolcreatedb,
+            'can_create_role', v_role_info.rolcreaterole
+        ),
+        'metrics', jsonb_build_object(
+            'database_size_human', v_db_size,
+            'database_size_bytes', pg_database_size(current_database()),
+            'active_connections', v_conn_count,
+            'cache_hit_ratio_percent', v_cache_hit_ratio
+        ),
+        'system_health', jsonb_build_object(
+            'version', version(),
+            'uptime_since', pg_postmaster_start_time(), -- Quando o servidor ligou
+            'rls_enforced_in_session', current_setting('row_security', true)
+        )
+    );
+
+    RETURN v_result;
+END;
+$$;
+
+
+-- Cria automaticamente tenant_id e created_by
+CREATE OR REPLACE FUNCTION fn_set_tenant_and_creator()
+RETURNS TRIGGER
+SET search_path = public, pg_temp AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        NEW.tenant_id := COALESCE(NEW.tenant_id, current_user_tenant_id());
+        NEW.created_by := COALESCE(NEW.created_by, current_user_id());
+    ELSIF TG_OP = 'UPDATE' THEN
+        NEW.tenant_id := OLD.tenant_id;
+        NEW.created_by := OLD.created_by;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
 
 -- ============================================================================
 -- API USER
@@ -33,21 +129,44 @@ $func$  LANGUAGE sql IMMUTABLE;
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'app_runtime') THEN
-        CREATE ROLE app_runtime NOLOGIN;
+        CREATE USER app_runtime WITH PASSWORD 'sua_senha_forte_aqui';
     END IF;
-END
-$$;
+END $$;
 
-GRANT app_runtime TO postgres;
-
+-- 2. Permissões no schema public
 GRANT USAGE ON SCHEMA public TO app_runtime;
-GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO app_runtime;
-GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO app_runtime;
 
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO app_runtime;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO app_runtime;
+-- Permissões em tabelas
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_runtime;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public 
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_runtime;
+
+-- Permissões em sequences
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_runtime;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public 
+    GRANT USAGE, SELECT ON SEQUENCES TO app_runtime;
+
+-- Permissões em Funções e Procedures (CORRIGIDO AQUI) 🛠️
+-- O GRANT direto aceita PROCEDURES (Postgres 11+)
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO app_runtime;
+GRANT EXECUTE ON ALL PROCEDURES IN SCHEMA public TO app_runtime;
+
+-- Mas o ALTER DEFAULT PRIVILEGES exige 'ROUTINES' para cobrir ambos
+ALTER DEFAULT PRIVILEGES IN SCHEMA public 
+    GRANT EXECUTE ON ROUTINES TO app_runtime;
+
+-- 3. Schema extensions
+GRANT USAGE ON SCHEMA extensions TO app_runtime;
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA extensions TO app_runtime;
+ALTER DEFAULT PRIVILEGES IN SCHEMA extensions 
+    GRANT EXECUTE ON ROUTINES TO app_runtime; -- Usei ROUTINES aqui também por segurança
+
+-- 4. Habilitar Row Level Security
 ALTER ROLE app_runtime SET row_security = on;
 
+-- 5. Configurações de segurança
+ALTER ROLE app_runtime SET statement_timeout = '30s';
+ALTER ROLE app_runtime SET idle_in_transaction_session_timeout = '60s';
 -- ============================================================================
 -- ENUMS
 -- ============================================================================
@@ -233,11 +352,11 @@ EXCEPTION
     WHEN duplicate_object THEN null;
 END $$;
 
+
 -- ============================================================================
 -- FUNCTIONS - Funções auxiliares do banco de dados
 -- ============================================================================
 
--- Atualiza automaticamente o campo updated_at quando um registro é modificado
 CREATE OR REPLACE FUNCTION update_updated_at_column()
 RETURNS TRIGGER SET search_path = public, extensions, pg_temp AS $$
 BEGIN
@@ -246,58 +365,12 @@ BEGIN
 END;
 $$ language 'plpgsql';
 
-
--- Retorna o nível de privilégio de uma role (quanto maior, mais poder)
-CREATE OR REPLACE FUNCTION get_role_privilege_level(role user_role_enum)
-RETURNS INTEGER SET search_path = public, extensions, pg_temp AS $$
-BEGIN
-    RETURN CASE role
-        WHEN 'ADMIN' THEN 120
-        WHEN 'GERENTE'    THEN 99
-        WHEN 'FINANCEIRO' THEN 92
-        WHEN 'CONTADOR'   THEN 80        
-        WHEN 'FISCAL_CAIXA' THEN 70
-        WHEN 'COMPRADOR'    THEN 60            
-        WHEN 'CAIXA'    THEN 50
-        WHEN 'VENDEDOR' THEN 50
-        WHEN 'GARCOM'   THEN 50
-        WHEN 'ESTOQUISTA' THEN 40
-        WHEN 'BARMAN'     THEN 30
-        WHEN 'COZINHA'    THEN 30
-        WHEN 'ENTREGADOR' THEN 20
-        WHEN 'REPOSITOR'  THEN 20        
-        WHEN 'CLIENTE' THEN 0
-        ELSE 0
-    END;
-END;
-$$ LANGUAGE plpgsql IMMUTABLE;
-
-
--- Retorna o nível máximo de privilégio de um array de roles
-CREATE OR REPLACE FUNCTION get_max_privilege_from_roles(roles user_role_enum[])
-RETURNS INTEGER SET search_path = public, extensions, pg_temp AS $$
-DECLARE
-    role user_role_enum;
-    max_level INTEGER := 0;
-    current_level INTEGER;
-BEGIN
-    IF roles IS NULL THEN RETURN 0; END IF;
-    FOREACH role IN ARRAY roles LOOP
-        current_level := get_role_privilege_level(role);
-        IF current_level > max_level THEN
-            max_level := current_level;
-        END IF;
-    END LOOP;
-    RETURN max_level;
-END;
-$$ LANGUAGE plpgsql IMMUTABLE;
-
 -- ============================================================================
 -- APP TOKENS
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS app_tokens (
-    service_name VARCHAR(50) PRIMARY KEY, -- ex: 'nuvem_fiscal'
+    service_name VARCHAR(50) PRIMARY KEY,
     access_token TEXT NOT NULL,
     expires_at TIMESTAMP NOT NULL,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -357,26 +430,94 @@ CREATE TABLE IF NOT EXISTS ibpt_versions (
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS fiscal_ncms (    
-    code TEXT NOT NULL,
-    uf VARCHAR(2) NOT NULL,
-    version TEXT NOT NULL,
+    code TEXT NOT NULL PRIMARY KEY,
     description TEXT NOT NULL, -- Descrição oficial (Ex: "Cervejas de malte")
     -- Alíquotas aproximadas (Lei 12.741/2012 - De Olho no Imposto)
     federal_national_rate NUMERIC(5, 2) DEFAULT 0, -- Imposto Federal (Produtos Nacionais)
     federal_import_rate NUMERIC(5, 2) DEFAULT 0,   -- Imposto Federal (Produtos Importados)
     state_rate NUMERIC(5, 2) DEFAULT 0,            -- Imposto Estadual (ICMS aproximado)
     municipal_rate NUMERIC(5, 2) DEFAULT 0,        -- Imposto Municipal (Serviços)
-        
-    PRIMARY KEY (code, uf),
-    FOREIGN KEY (version) REFERENCES ibpt_versions(version) ON DELETE CASCADE ON UPDATE CASCADE,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    fts_vector tsvector GENERATED ALWAYS AS (to_tsvector('portuguese', immutable_unaccent(description))) STORED
 );
 
-CREATE INDEX IF NOT EXISTS idx_fiscal_ncms_version ON fiscal_ncms(version);
-CREATE INDEX IF NOT EXISTS idx_fiscal_ncms_uf ON fiscal_ncms(uf);
-CREATE INDEX IF NOT EXISTS idx_fiscal_ncms_code_uf ON fiscal_ncms (uf, code);
-CREATE INDEX IF NOT EXISTS idx_fiscal_ncms_desc_trgm ON fiscal_ncms USING gin (immutable_unaccent(description) gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_fiscal_ncms_code_pattern ON fiscal_ncms (code text_pattern_ops);
+
+CREATE INDEX IF NOT EXISTS idx_fiscal_ncms_fts ON fiscal_ncms USING GIN (fts_vector);
+
+
+CREATE OR REPLACE FUNCTION search_ncms_optimized(
+    search_term TEXT, 
+    p_limit INTEGER DEFAULT 64, 
+    p_offset INTEGER DEFAULT 0
+)
+RETURNS TABLE (
+    -- Listamos as colunas explicitamente para adicionar o total_count
+    code TEXT,
+    description TEXT,
+    federal_national_rate NUMERIC,
+    federal_import_rate NUMERIC,
+    state_rate NUMERIC,
+    municipal_rate NUMERIC,    
+    fts_vector tsvector,
+    total_count INTEGER
+) AS $$
+DECLARE
+    formatted_query tsquery;
+    clean_term TEXT;
+BEGIN
+    clean_term := immutable_unaccent(trim(search_term));
+
+    -- CASO 1: Termo vazio (Retorna tudo ordenado por código)
+    IF clean_term = '' THEN
+        RETURN QUERY
+        SELECT 
+            f.code,
+            f.description, 
+            f.federal_national_rate, 
+            f.federal_import_rate, 
+            f.state_rate, 
+            f.municipal_rate,
+            f.fts_vector,
+            COUNT(*) OVER()::INTEGER AS total_count
+        FROM 
+            fiscal_ncms f
+        ORDER BY 
+            f.code ASC
+        LIMIT 
+            p_limit
+        OFFSET 
+            p_offset;
+        RETURN;
+    END IF;
+
+    -- CASO 2: Busca com termo
+    formatted_query := to_tsquery('portuguese', replace(clean_term, ' ', ':* & ') || ':*');
+
+    RETURN QUERY
+    SELECT 
+        f.code,
+        f.description, 
+        f.federal_national_rate, 
+        f.federal_import_rate, 
+        f.state_rate, 
+        f.municipal_rate,        
+        f.fts_vector,
+        COUNT(*) OVER()::INTEGER AS total_count
+    FROM 
+        fiscal_ncms f
+    WHERE 
+        f.code = search_term
+        OR 
+        f.fts_vector @@ formatted_query
+    ORDER BY 
+        (CASE WHEN f.code = search_term THEN 10.0 ELSE 0.0 END) DESC,
+        ts_rank(f.fts_vector, formatted_query) DESC
+    LIMIT
+        p_limit
+    OFFSET
+        p_offset;
+
+END;
+$$ LANGUAGE plpgsql;
 
 -- ============================================================================
 -- CNPJS
@@ -430,7 +571,60 @@ CREATE TABLE IF NOT EXISTS tenants (
 
 
 -- ============================================================================
--- USUÁRIOS - Cadastro de funcionários e clientes
+-- ROLE CONFIG
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS role_configs (
+    role_name user_role_enum PRIMARY KEY,
+    level_weight INTEGER NOT NULL DEFAULT 0,
+    description TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Popula com os seus dados atuais
+INSERT INTO role_configs (role_name, level_weight, description) VALUES
+    ('ADMIN', 120, 'Acesso total ao sistema'),
+    ('GERENTE', 99, 'Gestão de loja e equipe'),
+    ('FINANCEIRO', 92, 'Acesso a relatórios financeiros e caixa'),
+    ('CONTADOR', 80, 'Exportação de dados fiscais'),
+    ('FISCAL_CAIXA', 70, 'Gerente de frente de caixa'),
+    ('COMPRADOR', 60, 'Gestão de estoque e compras'),
+    ('CAIXA', 50, 'Operador de PDV'),
+    ('VENDEDOR', 50, 'Vendas e orçamentos'),
+    ('GARCOM', 50, 'Pedidos e mesas'),
+    ('ESTOQUISTA', 40, 'Conferência e entrada de notas'),
+    ('BARMAN', 30, 'Produção de bebidas'),
+    ('COZINHA', 30, 'Produção de pratos'),
+    ('ENTREGADOR', 20, 'Logística e entrega'),
+    ('REPOSITOR', 20, 'Organização de gôndola'),
+    ('CLIENTE', 0, 'Consumidor final')
+ON CONFLICT
+    (role_name)
+DO UPDATE SET
+    level_weight = EXCLUDED.level_weight,
+    description = EXCLUDED.description;
+
+
+CREATE OR REPLACE FUNCTION trg_update_users_on_config_change()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF OLD.level_weight IS DISTINCT FROM NEW.level_weight THEN
+        UPDATE users
+        SET updated_at = CURRENT_TIMESTAMP
+        WHERE NEW.role_name = ANY(roles);
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE TRIGGER refresh_users_privileges
+AFTER UPDATE ON role_configs
+FOR EACH ROW
+EXECUTE FUNCTION trg_update_users_on_config_change();
+
+
+-- ============================================================================
+-- USUÁRIOS
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS users (
@@ -449,13 +643,13 @@ CREATE TABLE IF NOT EXISTS users (
     quick_access_pin_hash TEXT, -- PIN numérico hasheado (Acesso rápido PDV Touch)
     
     -- Fiscal e Financeiro (Cliente)
-    state_tax_indicator SMALLINT DEFAULT 9,
+    state_tax_indicator INTEGER DEFAULT 9,
     loyalty_points INTEGER DEFAULT 0, -- Pontos de Fidelidade acumulados
 
     -- Profissional (Funcionário)
     commission_percentage NUMERIC(5, 2) DEFAULT 0, -- Ex: 10% para garçom, 2% para vendedor
 
-    max_privilege_level INTEGER GENERATED ALWAYS AS (get_max_privilege_from_roles(roles)) STORED,
+    max_privilege_level INTEGER DEFAULT 0,
 
     -- Status e Bloqueio
     is_active BOOLEAN NOT NULL DEFAULT TRUE, -- Soft Delete
@@ -476,160 +670,51 @@ CREATE TABLE IF NOT EXISTS users (
     FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE,
     CONSTRAINT users_roles_not_empty CHECK (roles IS NOT NULL AND array_length(roles, 1) > 0),
     CONSTRAINT users_valid_cpf_cstr CHECK (cpf IS NULL OR cpf ~ '^\d{11}$'),
-    CONSTRAINT users_valid_email_cstr CHECK (email IS NULL OR email ~* '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'),
+    CONSTRAINT users_valid_email_cstr CHECK (
+        email IS NULL OR (
+            email ~* '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'
+            AND email NOT LIKE '%..%'
+            AND length(email) >= 6
+        )
+    ),
     CONSTRAINT users_name_length_cstr CHECK (length(name) BETWEEN 2 AND 256),
     CONSTRAINT users_commission_chk CHECK (commission_percentage BETWEEN 0 AND 100)
 );
+
 
 -- Índices
 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 CREATE INDEX IF NOT EXISTS idx_users_cpf ON users(cpf);
 CREATE INDEX IF NOT EXISTS idx_users_name ON users USING gin(name gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_users_tenant ON users(tenant_id);
-CREATE INDEX IF NOT EXISTS idx_users_privilege_level_asc ON users(tenant_id, max_privilege_level ASC);
+CREATE INDEX IF NOT EXISTS idx_users_tenant ON users USING btree (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_users_roles ON users USING gin (roles);
 CREATE INDEX IF NOT EXISTS idx_users_privilege_level_desc ON users(tenant_id, max_privilege_level DESC) WHERE is_active = TRUE;
-CREATE INDEX IF NOT EXISTS idx_users_roles_btree ON users USING btree(tenant_id, roles);
+CREATE INDEX IF NOT EXISTS idx_users_privilege_level_asc ON users(tenant_id, max_privilege_level ASC) WHERE is_active = TRUE;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_unique ON users(email, tenant_id) WHERE email IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_cpf_unique ON users(cpf, tenant_id) WHERE cpf IS NOT NULL;
 
 
-CREATE OR REPLACE FUNCTION guard_users_modification()
-RETURNS TRIGGER SET search_path = public, extensions, pg_temp AS $$
-DECLARE
-    v_my_role_level INTEGER;
-    v_my_id UUID;
-    v_my_tenant UUID;
-BEGIN
-
-    -- Bypass
-    IF SESSION_USER = 'postgres' THEN
-        RETURN NEW;
-    END IF;  
-
-    -- Carrega contexto atual (usando suas funções auxiliares)
-    v_my_id := current_user_id();
-
-    IF v_my_id IS NULL THEN
-        RAISE EXCEPTION 'Contexto de sessão inválido. current_user_id() não está configurado.';
-    END IF;
-    
-    v_my_role_level := current_user_max_privilege();
-    v_my_tenant := current_user_tenant_id();
-
-    -- Verifica a integridade das funções do usuário
-    IF NEW.roles IS NULL OR array_length(NEW.roles, 1) = 0 THEN
-        NEW.roles := ARRAY['CLIENTE']::user_role_enum[];
-    END IF;
-
-    -- 1. VALIDAÇÃO DE TENANT (Segurança Suprema)
-    -- Ninguém pode tocar em dados de outro tenant
-    IF (TG_OP = 'INSERT' OR TG_OP = 'UPDATE') THEN
-        IF NEW.tenant_id != v_my_tenant THEN
-            RAISE EXCEPTION 'SECURITY VIOLATION: Tentativa de operação em tenant cruzado (Cross-Tenant).' 
-            USING ERRCODE = 'P0001';
-        END IF;
-    END IF;
-    
-    IF (TG_OP = 'DELETE' OR TG_OP = 'UPDATE') THEN
-        IF OLD.tenant_id != v_my_tenant THEN
-            RAISE EXCEPTION 'SECURITY VIOLATION: Este usuário pertence a outro tenant.' 
-            USING ERRCODE = 'P0001';
-        END IF;
-    END IF;
-
-    -- 2. REGRAS DE INSERT
-    IF (TG_OP = 'INSERT') THEN
-        -- Regra: Cliente (0) só pode ser criado por quem tem privilégio > 0
-        IF NEW.max_privilege_level = 0 THEN
-            IF v_my_role_level <= 0 THEN
-                RAISE EXCEPTION 'PERMISSÃO NEGADA: Clientes não podem criar outros clientes.'
-                USING ERRCODE = 'P0002';
-            END IF;
-        ELSE
-            -- Regra: Para criar Staff, preciso ter 70+ E ser superior ao criado
-            IF v_my_role_level < 70 THEN
-                RAISE EXCEPTION 'PERMISSÃO NEGADA: Apenas Gestores (70+) podem criar Staff.'
-                USING ERRCODE = 'P0002';
-            END IF;
-            
-            IF v_my_role_level < NEW.max_privilege_level THEN
-                RAISE EXCEPTION 'HIERARQUIA: Você (Nível %) não pode criar alguém com nível superior ao seu (Nível %).', v_my_role_level, NEW.max_privilege_level
-                USING ERRCODE = 'P0002';
-            END IF;
-        END IF;
-    END IF;
-
-    -- 3. REGRAS DE UPDATE
-    IF (TG_OP = 'UPDATE') THEN
-        -- Permite atualizar a si mesmo (ex: mudar senha/foto)
-        IF OLD.id = v_my_id THEN
-            -- Mas não pode subir o próprio cargo!
-            IF NEW.max_privilege_level > v_my_role_level THEN
-                 RAISE EXCEPTION 'FRAUDE: Você não pode aumentar seu próprio nível de privilégio.'
-                 USING ERRCODE = 'P0003';
-            END IF;
-            RETURN NEW; -- Se for ele mesmo e não subiu cargo, libera.
-        END IF;
-
-        -- Se não sou eu, preciso ser chefe (70+)
-        IF v_my_role_level < 70 THEN
-            RAISE EXCEPTION 'PERMISSÃO NEGADA: Apenas Gestores podem editar outros usuários.'
-            USING ERRCODE = 'P0002';
-        END IF;
-
-        -- E o alvo deve ser inferior ou igual
-        IF v_my_role_level < OLD.max_privilege_level THEN
-             RAISE EXCEPTION 'HIERARQUIA: Você não pode editar um usuário com patente superior à sua.'
-             USING ERRCODE = 'P0002';
-        END IF;
-        
-        -- E não posso promover ele acima de mim
-        IF v_my_role_level < NEW.max_privilege_level THEN
-             RAISE EXCEPTION 'HIERARQUIA: Você não pode promover alguém para um nível acima do seu.'
-             USING ERRCODE = 'P0002';
-        END IF;
-    END IF;
-
-    -- 4. REGRAS DE DELETE
-    IF (TG_OP = 'DELETE') THEN
-        IF OLD.id = v_my_id THEN
-            RAISE EXCEPTION 'SUICÍDIO DE DADOS: Você não pode deletar sua própria conta. Contate um superior.'
-            USING ERRCODE = 'P0004';
-        END IF;
-
-        IF v_my_role_level < 92 THEN
-            RAISE EXCEPTION 'PERMISSÃO NEGADA: Apenas Admins (92+) podem deletar usuários.'
-            USING ERRCODE = 'P0002';
-        END IF;
-
-        IF v_my_role_level < OLD.max_privilege_level THEN
-            RAISE EXCEPTION 'HIERARQUIA: Você não pode deletar um superior.'
-            USING ERRCODE = 'P0002';
-        END IF;
-    END IF;
-
-    RETURN NEW;
+CREATE OR REPLACE FUNCTION trg_calculate_max_privilege()
+RETURNS TRIGGER AS $$
+BEGIN    
+    SELECT 
+        COALESCE(MAX(level_weight), 0)
+    INTO 
+        NEW.max_privilege_level
+    FROM 
+        role_configs
+    WHERE 
+        role_name = ANY(NEW.roles);    
+    RETURN 
+        NEW;
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE TRIGGER trg_guard_users_modification
-BEFORE INSERT OR UPDATE OR DELETE ON users
-FOR EACH ROW EXECUTE FUNCTION guard_users_modification();
+CREATE OR REPLACE TRIGGER set_max_privilege_on_user_change
+BEFORE INSERT OR UPDATE ON users
+FOR EACH ROW
+EXECUTE FUNCTION trg_calculate_max_privilege();
 
-
-CREATE OR REPLACE FUNCTION update_last_login_safe(p_user_id UUID)
-RETURNS VOID
-SET search_path = public, extensions, pg_temp
-AS $$
-BEGIN
-    UPDATE 
-        users 
-    SET 
-        last_login_at = CURRENT_TIMESTAMP
-    WHERE 
-        id = p_user_id;
-END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
 
 CREATE OR REPLACE FUNCTION get_user_login_data(p_identifier TEXT)
 RETURNS TABLE (
@@ -639,12 +724,12 @@ RETURNS TABLE (
     email TEXT,
     password_hash TEXT,
     notes TEXT,
-    state_tax_indicator TEXT,
+    state_tax_indicator INTEGER,
     created_at TIMESTAMPTZ,
     created_by UUID,
     updated_at TIMESTAMPTZ,
     tenant_id UUID,
-    roles TEXT[],
+    roles user_role_enum[],
     max_privilege_level INTEGER
 ) 
 SET search_path = public, extensions, pg_temp AS $$
@@ -663,12 +748,12 @@ BEGIN
         u.email::TEXT,
         u.password_hash,
         u.notes,
-        u.state_tax_indicator::TEXT,
+        u.state_tax_indicator,
         u.created_at::TIMESTAMPTZ,
         u.created_by,
         u.updated_at::TIMESTAMPTZ,
         u.tenant_id,
-        u.roles::TEXT[],
+        u.roles,
         u.max_privilege_level
     FROM 
         users u
@@ -682,6 +767,11 @@ BEGIN
     LIMIT 1;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
+
+
+CREATE OR REPLACE TRIGGER trg_users_updated_at
+BEFORE UPDATE ON users
+FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- ============================================================================
 -- CATEGORIES
@@ -727,8 +817,12 @@ CREATE TABLE IF NOT EXISTS categories (
 
 
 CREATE INDEX IF NOT EXISTS idx_categories_tenant_parent ON categories(tenant_id, parent_id);
-CREATE INDEX IF NOT EXISTS idx_categories_display ON categories(tenant_id, sort_order) WHERE is_active = TRUE;
 CREATE INDEX IF NOT EXISTS idx_categories_name_search ON categories USING GIN (name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_categories_active_sort ON categories (tenant_id, sort_order, name) WHERE is_active = TRUE;
+
+CREATE OR REPLACE TRIGGER trg_categories_updated_at
+BEFORE UPDATE ON categories
+FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 
 CREATE OR REPLACE FUNCTION get_category_tree(target_tenant_id UUID)
@@ -781,7 +875,6 @@ $$ LANGUAGE plpgsql STABLE;
 -- ============================================================================
 -- SUPPLIERS - Cadastro de fornecedores de produtos
 -- ============================================================================
-
 
 CREATE TABLE IF NOT EXISTS suppliers (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -858,6 +951,7 @@ CREATE TABLE IF NOT EXISTS tax_groups (
 
 CREATE INDEX IF NOT EXISTS idx_tax_groups_tenant_id ON tax_groups(tenant_id);
 
+
 -- ============================================================================
 -- PRODUCTS
 -- ============================================================================
@@ -918,13 +1012,6 @@ CREATE TABLE IF NOT EXISTS products (
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     is_blocked_on_negative_stock BOOLEAN NOT NULL DEFAULT FALSE, -- Impede venda se estoque zerar
 
-    -- Busca textual
-    search_vector tsvector GENERATED ALWAYS AS (
-        setweight(to_tsvector('portuguese', COALESCE(name, '')), 'A') ||
-        setweight(to_tsvector('portuguese', COALESCE(description, '')), 'B') ||
-        setweight(to_tsvector('portuguese', COALESCE(sku, '')), 'C')
-    ) STORED,
-
     -- Auditoria
     tenant_id UUID NOT NULL,
     created_by UUID,
@@ -950,9 +1037,18 @@ CREATE INDEX IF NOT EXISTS idx_products_pos_list ON products(tenant_id, category
 CREATE INDEX IF NOT EXISTS idx_products_gtin ON products(tenant_id, gtin) WHERE gtin IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_products_low_stock ON products(tenant_id) WHERE stock_quantity <= min_stock_quantity AND is_active = TRUE AND type = 'STANDARD';
 CREATE INDEX IF NOT EXISTS idx_products_active_stock ON products(tenant_id, is_active, stock_quantity) WHERE type = 'STANDARD';
-CREATE INDEX IF NOT EXISTS idx_products_search ON products USING GIN(search_vector);
-CREATE INDEX IF NOT EXISTS idx_products_fts ON products USING GIN(to_tsvector('portuguese', name || ' ' || description));
 CREATE INDEX IF NOT EXISTS idx_products_negative_stock ON products(tenant_id, stock_quantity) WHERE stock_quantity < 0;
+CREATE INDEX IF NOT EXISTS idx_products_fts ON products USING GIN(
+    (
+        setweight(to_tsvector('portuguese', name), 'A') ||
+        setweight(to_tsvector('portuguese', COALESCE(LEFT(description, 500), '')), 'B') ||
+        setweight(to_tsvector('portuguese', sku), 'C')
+    )
+) WHERE is_active = TRUE;
+
+CREATE OR REPLACE TRIGGER trg_products_updated_at
+BEFORE UPDATE ON products
+FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 
 CREATE OR REPLACE FUNCTION generate_numeric_sku(p_digits INT DEFAULT 5)
@@ -1012,43 +1108,6 @@ CREATE OR REPLACE TRIGGER trg_products_auto_sku
 BEFORE INSERT ON products
 FOR EACH ROW
 EXECUTE FUNCTION ensure_unique_sku();
-
-
--- MELHORAR TRIGGER DE AUDITORIA DE PREÇOS:
-CREATE OR REPLACE FUNCTION fn_audit_price_changes()
-RETURNS TRIGGER SET search_path = public, extensions, pg_temp AS $$
-BEGIN
-    IF TG_OP = 'UPDATE' AND (
-        OLD.sale_price != NEW.sale_price OR
-        OLD.cost_price != NEW.cost_price OR
-        OLD.promo_price != NEW.promo_price
-    ) THEN
-        INSERT INTO price_audits (
-            product_id,
-            old_purchase_price,
-            new_purchase_price,
-            old_sale_price,
-            new_sale_price,
-            changed_by,
-            changed_at
-        ) VALUES (
-            NEW.id,
-            OLD.cost_price,
-            NEW.cost_price,
-            OLD.sale_price,
-            NEW.sale_price,
-            COALESCE(current_user_id(), NEW.created_by),
-            NOW()
-        );
-    END IF;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
--- Aplicar trigger se não existir
-CREATE OR REPLACE TRIGGER trg_products_price_audit
-AFTER UPDATE ON products
-FOR EACH ROW EXECUTE FUNCTION fn_audit_price_changes();
 
 
 CREATE OR REPLACE FUNCTION search_products(search_query TEXT)
@@ -1144,6 +1203,7 @@ CREATE TABLE IF NOT EXISTS product_compositions (
 
 CREATE INDEX IF NOT EXISTS idx_compositions_tenant_parent ON product_compositions(tenant_id, parent_product_id);
 
+
 -- ============================================================================
 -- PRODUCT MOFIFIER GROUPS
 -- ============================================================================
@@ -1210,6 +1270,9 @@ CREATE TABLE IF NOT EXISTS batches (
 
 CREATE INDEX IF NOT EXISTS idx_batches_fifo ON batches(product_id, expiration_date ASC) WHERE current_quantity > 0 AND is_blocked = FALSE;
 
+CREATE OR REPLACE TRIGGER trg_batches_updated_at
+BEFORE UPDATE ON batches
+FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- ============================================================================
 -- ENDEREÇOS - Endereços de usuários/clientes
@@ -1232,6 +1295,10 @@ CREATE TABLE IF NOT EXISTS addresses (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE OR REPLACE TRIGGER trg_addresses_updated_at
+BEFORE UPDATE ON addresses
+FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 CREATE TABLE IF NOT EXISTS user_addresses (
     user_id UUID NOT NULL,
@@ -1260,9 +1327,19 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE ON UPDATE CASCADE
 );
 
+
+CREATE INDEX IF NOT EXISTS idx_refresh_token_users ON refresh_tokens(user_id);
 CREATE INDEX IF NOT EXISTS idx_refresh_token_family ON refresh_tokens(family_id);
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_active_family ON refresh_tokens(family_id) WHERE revoked = FALSE;
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_expires_at ON refresh_tokens (expires_at);
+
+
+-- SELECT cron.schedule(
+--     'delete_revoked_tokens',
+--     '0 6 * * 0',
+--     $$DELETE FROM refresh_tokens WHERE revoked = TRUE$$
+-- );
+-- SELECT * FROM cron.job;
 
 -- ============================================================================
 -- PRICE AUDITS - Histórico de alterações de preços
@@ -1333,66 +1410,33 @@ ALTER TABLE stock_movements SET (
 
 
 CREATE OR REPLACE FUNCTION fn_update_stock_balance()
-RETURNS TRIGGER SECURITY DEFINER SET search_path = public, extensions, pg_temp AS $$
-DECLARE
-    movement_multiplier INTEGER;
+RETURNS TRIGGER AS $$
 BEGIN
-    -- 1. Define se a operação Soma (1) ou Subtrai (-1)
-    CASE NEW.type
-        -- Entradas
-        WHEN 'COMPRA' THEN movement_multiplier := 1;
-        WHEN 'BONIFICACAO' THEN movement_multiplier := 1;
-        WHEN 'DEVOLUCAO_CLIENTE' THEN movement_multiplier := 1;
-        WHEN 'AJUSTE_ENTRADA' THEN movement_multiplier := 1;
-        WHEN 'PRODUCAO_ENTRADA' THEN movement_multiplier := 1;
-        WHEN 'TRANSFERENCIA_ENTRADA' THEN movement_multiplier := 1;
-        WHEN 'INVENTARIO_INICIAL' THEN movement_multiplier := 1;
-        WHEN 'CANCELAMENTO' THEN movement_multiplier := 1;
-        
-        -- Saídas
-        WHEN 'VENDA' THEN movement_multiplier := -1;
-        WHEN 'DEVOLUCAO_FORNECEDOR' THEN movement_multiplier := -1;
-        WHEN 'PERDA' THEN movement_multiplier := -1;
-        WHEN 'QUEBRA' THEN movement_multiplier := -1;
-        WHEN 'VENCIMENTO' THEN movement_multiplier := -1;
-        WHEN 'FURTO' THEN movement_multiplier := -1;
-        WHEN 'AVARIA' THEN movement_multiplier := -1;
-        WHEN 'CONSUMO_INTERNO' THEN movement_multiplier := -1;
-        WHEN 'AJUSTE_SAIDA' THEN movement_multiplier := -1;
-        WHEN 'PRODUCAO_SAIDA' THEN movement_multiplier := -1;
-        WHEN 'TRANSFERENCIA_SAIDA' THEN movement_multiplier := -1;
-        
-        -- Neutros (Ou tipos futuros)
-        ELSE movement_multiplier := 0;
-    END CASE;
-
-    -- Se o multiplicador for 0, não faz nada
-    IF movement_multiplier = 0 THEN
-        RETURN NEW;
-    END IF;
-
-    -- 2. Atualiza o Estoque Geral do Produto
-    UPDATE products
-SET stock_quantity = stock_quantity + (NEW.quantity * movement_multiplier)
-WHERE id = NEW.product_id;
-
-    -- 3. Se houver Lote vinculado, atualiza o saldo do Lote
-    IF NEW.batch_id IS NOT NULL THEN
-        UPDATE batches
-        SET 
-            current_quantity = current_quantity + (NEW.quantity * movement_multiplier),
-            updated_at = NOW()
-        WHERE id = NEW.batch_id;
-    END IF;
-
-    RETURN NEW;
+    UPDATE products p
+    SET stock_quantity = stock_quantity + agg.delta
+    FROM (
+        SELECT 
+            product_id,
+            SUM(
+                CASE 
+                    WHEN type IN ('COMPRA', 'DEVOLUCAO_CLIENTE', 'AJUSTE_ENTRADA', 'CANCELAMENTO') 
+                    THEN quantity 
+                    ELSE -quantity 
+                END
+            ) as delta
+        FROM new_table
+        GROUP BY product_id
+    ) agg
+    WHERE p.id = agg.product_id;
+    
+    RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
 
 CREATE OR REPLACE TRIGGER trg_stock_movements_balance
 AFTER INSERT ON stock_movements
-FOR EACH ROW
-EXECUTE FUNCTION fn_update_stock_balance();
+FOR EACH ROW EXECUTE FUNCTION fn_update_stock_balance();
+
 
 -- ============================================================================
 -- FISCAL_SEQUENCES
@@ -1416,34 +1460,12 @@ CREATE TABLE IF NOT EXISTS fiscal_sequences (
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
 );
 
-CREATE OR REPLACE FUNCTION get_next_fiscal_number(
-    p_tenant_id UUID,
-    p_series INTEGER,
-    p_model VARCHAR
-) 
-RETURNS INTEGER SET search_path = public, extensions, pg_temp AS $$
-DECLARE
-    v_new_number INTEGER;
-BEGIN
-    -- Tenta atualizar e retornar o novo valor (Lock atômico)
-    INSERT INTO fiscal_sequences (tenant_id, series, model, current_number, updated_at)
-    VALUES (p_tenant_id, p_series, p_model, 1, NOW())
-    ON CONFLICT (tenant_id, series, model)
-    DO UPDATE SET 
-        current_number = fiscal_sequences.current_number + 1,
-        updated_at = NOW()
-    RETURNING current_number INTO v_new_number;
-
-    RETURN v_new_number;
-END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
-
 -- ============================================================================
 -- SALES
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS sales (
-    id UUID DEFAULT uuid_generate_v4(),
+    id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
     
     -- Totais
     subtotal NUMERIC(10, 2) NOT NULL DEFAULT 0,
@@ -1464,7 +1486,7 @@ CREATE TABLE IF NOT EXISTS sales (
     waiter_id UUID,         -- Garçom (diferente do caixa que fecha a conta)
 
     -- Dados Fiscais (Snapshot da Nota Fiscal)
-    fiscal_key VARCHAR(44),     -- Chave de acesso da NFe/NFCe
+    fiscal_key TEXT,     -- Chave de acesso da NFe/NFCe
     fiscal_number INTEGER,      -- Número da nota
     fiscal_series INTEGER,      -- Série
     fiscal_model VARCHAR(2),    -- '65' (NFCe) ou '59' (SAT)
@@ -1477,119 +1499,70 @@ CREATE TABLE IF NOT EXISTS sales (
     -- Auditoria e Isolamento
     tenant_id UUID NOT NULL,
     created_by UUID, -- Quem abriu a venda (geralmente o Caixa)
-    created_at TIMESTAMP,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     finished_at TIMESTAMP,
-
-    PRIMARY KEY (id, created_at),
-
-    CONSTRAINT sales_fiscal_key_unique UNIQUE (tenant_id, fiscal_key, created_at),
+    
+    CONSTRAINT check_sales_positive_amount CHECK (total_amount >= 0),
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE ON UPDATE CASCADE,
     FOREIGN KEY (salesperson_id) REFERENCES users(id) ON DELETE SET NULL,
     FOREIGN KEY (waiter_id) REFERENCES users(id) ON DELETE SET NULL,
     FOREIGN KEY (customer_id) REFERENCES users(id) ON DELETE SET NULL,
     FOREIGN KEY (cancelled_by) REFERENCES users(id) ON DELETE SET NULL,
     FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
-) PARTITION BY RANGE (created_at);
+);
 
 
-CREATE INDEX IF NOT EXISTS idx_sales_tenant_status_created ON sales(tenant_id, status, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_sales_fiscal ON sales(tenant_id, fiscal_number, fiscal_series);
-CREATE INDEX IF NOT EXISTS idx_sales_command ON sales(tenant_id, command_number) WHERE status = 'ABERTA';
-CREATE INDEX IF NOT EXISTS idx_sales_dashboard ON sales(tenant_id, status, created_at DESC) INCLUDE (total_amount, salesperson_id);
-CREATE INDEX IF NOT EXISTS idx_sales_salesperson_id ON sales(salesperson_id);
-CREATE INDEX IF NOT EXISTS idx_sales_customer_id ON sales(customer_id);
-CREATE INDEX IF NOT EXISTS idx_sales_waiter ON sales(tenant_id, waiter_id);
-CREATE INDEX IF NOT EXISTS idx_sales_date_range ON sales(tenant_id, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sales_fiscal_key_unique ON sales(tenant_id, fiscal_key) WHERE fiscal_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_sales_tenant ON sales(tenant_id);
+-- 1. Impede duas mesas abertas iguais na mesma loja
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sales_unique_open_table ON sales (tenant_id, table_number) WHERE status = 'ABERTA' AND table_number IS NOT NULL;
+-- 2. Impede duas comandas abertas iguais na mesma loja
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sales_unique_open_command ON sales (tenant_id, command_number) WHERE status = 'ABERTA' AND command_number IS NOT NULL;
 
 
--- [PARA GERENCIAR CANCELAMENTO DE VENDA]
-CREATE OR REPLACE FUNCTION fn_handle_sale_cancellation()
-RETURNS TRIGGER SET search_path = public, extensions, pg_temp AS $$
-BEGIN
-    -- Só age se mudou de QUALQUER status para 'CANCELADA'
-    IF NEW.status = 'CANCELADA' AND OLD.status != 'CANCELADA' THEN        
-        -- 1. Gera movimentação de estoque (Devolução)
-        -- A trigger da tabela 'stock_movements' vai capturar isso e 
-        -- atualizar o 'stock_quantity' em 'products' e 'batches' automaticamente.
-        INSERT INTO stock_movements (
-            tenant_id,
-            product_id,
-            batch_id, -- Importante devolver pro lote certo!
-            type,
-            quantity,
-            reference_id,
-            reason,
-            created_by
-        )
-        SELECT 
-            NEW.tenant_id,
-            si.product_id,
-            si.batch_id,
-            'CANCELAMENTO'::stock_movement_enum,
-            si.quantity, -- Positivo, pois a trigger de movimento sabe lidar com o tipo CANCELAMENTO
-            NEW.id,
-            'Cancelamento da Venda #' || NEW.fiscal_number,
-            NEW.cancelled_by
-        FROM sale_items si
-        WHERE 
-            si.sale_id = NEW.id 
-            AND si.sale_created_at = NEW.created_at;
-        
-        -- 2. Estorno Financeiro (Fiado)
-        -- Se a venda foi no fiado, precisamos estornar o saldo do cliente.
-        -- Verifique se existe pagamento do tipo CREDIARIO nesta venda
-        IF EXISTS (
-            SELECT 1 FROM sale_payments sp 
-            WHERE sp.sale_id = NEW.id AND sp.method = 'CREDIARIO'
-        ) THEN
-            -- Aqui você chamaria sua função de recalcular saldo ou inserir estorno no contas a receber
-            -- PERFORM fn_reverse_accounts_receivable(NEW.id);
-            NULL; -- Placeholder
-        END IF;
-
-    END IF;
-    
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE OR REPLACE TRIGGER trg_handle_sale_cancellation
-AFTER UPDATE OF status ON sales
-FOR EACH ROW EXECUTE FUNCTION fn_handle_sale_cancellation();
-
-
-CREATE OR REPLACE FUNCTION fn_validate_sale_totals()
-RETURNS TRIGGER SET search_path = public, extensions, pg_temp AS $$
+CREATE OR REPLACE FUNCTION get_next_fiscal_number(
+    p_tenant_id UUID,
+    p_series INTEGER,
+    p_model VARCHAR
+) 
+RETURNS INTEGER AS $$
 DECLARE
-    v_items_sum NUMERIC(15,2);
-    v_calc_total NUMERIC(15,2);
+    v_new_number INTEGER;
+    v_max_retries INTEGER := 5;
+    v_retry_count INTEGER := 0;
 BEGIN
-    IF NEW.status != 'CONCLUIDA' THEN
-        RETURN NEW;
-    END IF;
-
-    -- CORREÇÃO DA LYSANDRA: Adicionado sale_created_at para Partition Pruning
-    SELECT COALESCE(SUM(subtotal), 0)
-    INTO v_items_sum
-    FROM sale_items
-    WHERE sale_id = NEW.id 
-      AND sale_created_at = NEW.created_at; -- <--- O SEGREDO ESTÁ AQUI
-
-    v_calc_total := v_items_sum + COALESCE(NEW.shipping_fee, 0) + COALESCE(NEW.service_fee, 0) - COALESCE(NEW.total_discount, 0);
-
-    IF ABS(v_calc_total - NEW.total_amount) > 0.01 THEN
-        RAISE EXCEPTION 'FRAUDE/ERRO DETECTADO: Divergência de valores na Venda %. Itens+Taxas calc: %, Header diz: %', 
-            NEW.fiscal_number, v_calc_total, NEW.total_amount;
-    END IF;
-
-    RETURN NEW;
+    LOOP
+        BEGIN
+            INSERT INTO fiscal_sequences (
+                tenant_id, 
+                series, 
+                model, 
+                current_number, 
+                updated_at
+            )
+            VALUES 
+                (p_tenant_id, p_series, p_model, 1, NOW())
+            ON CONFLICT 
+                (tenant_id, series, model) 
+            DO UPDATE SET 
+                current_number = fiscal_sequences.current_number + 1,
+                updated_at = NOW()
+            RETURNING current_number INTO v_new_number;
+            
+            RETURN v_new_number;
+            
+        EXCEPTION WHEN serialization_failure OR deadlock_detected THEN
+            v_retry_count := v_retry_count + 1;
+            IF v_retry_count >= v_max_retries THEN
+                RAISE EXCEPTION 'Falha ao gerar número fiscal após % tentativas', v_max_retries;
+            END IF;
+            -- Espera exponencial: 10ms, 20ms, 40ms...
+            PERFORM pg_sleep(0.01 * power(2, v_retry_count));
+        END;
+    END LOOP;
 END;
-$$ LANGUAGE plpgsql;
-
-CREATE OR REPLACE TRIGGER trg_sales_validate_integrity
-BEFORE UPDATE OF status ON sales
-FOR EACH ROW
-EXECUTE FUNCTION fn_validate_sale_totals();
+$$ LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public, pg_temp;
 
 
 CREATE OR REPLACE FUNCTION fn_assign_fiscal_number()
@@ -1632,12 +1605,10 @@ EXECUTE FUNCTION fn_assign_fiscal_number();
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS sale_items (
-    id UUID DEFAULT uuid_generate_v4(),
-    tenant_id UUID NOT NULL, -- Desnormalização para RLS rápido
-    
+    id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
     sale_id UUID NOT NULL,
-    sale_created_at TIMESTAMP NOT NULL,
     product_id UUID NOT NULL,
+
     batch_id UUID, -- De qual lote saiu esse produto? (Importante p/ validade)
     
     -- Quantidades e Preços
@@ -1647,33 +1618,31 @@ CREATE TABLE IF NOT EXISTS sale_items (
     
     discount_amount NUMERIC(10, 2) DEFAULT 0, -- Desconto específico neste item
     subtotal NUMERIC(10, 2) GENERATED ALWAYS AS ((quantity * unit_sale_price) - discount_amount) STORED,
+    
+    is_cancelled BOOLEAN DEFAULT FALSE,
 
     -- Snapshot Fiscal (Lei da Transparência / SPED)
     cfop VARCHAR(4),
     ncm VARCHAR(8),
     tax_snapshot JSONB, -- Guarda ICMS, PIS, COFINS calculados no momento
     notes TEXT, -- "Sem cebola", "Bem passado"
-    PRIMARY KEY (id, sale_created_at),
-    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    
+    FOREIGN KEY (sale_id) REFERENCES sales(id) ON DELETE CASCADE,
     FOREIGN KEY (product_id) REFERENCES products(id),
-    FOREIGN KEY (batch_id) REFERENCES batches(id),
-    FOREIGN KEY (sale_id, sale_created_at) REFERENCES sales(id, created_at) ON DELETE CASCADE
-) PARTITION BY RANGE (sale_created_at);
+    FOREIGN KEY (batch_id) REFERENCES batches(id)
+);
 
-CREATE INDEX IF NOT EXISTS idx_sale_items_sale ON sale_items(sale_id);
-CREATE INDEX IF NOT EXISTS idx_sales_customer_lookup ON sales(id, customer_id, status);
-CREATE INDEX IF NOT EXISTS idx_sales_tenant_created_finished ON sales(tenant_id, created_at, finished_at) WHERE status = 'CONCLUIDA';
+CREATE INDEX IF NOT EXISTS idx_sale_items_validation ON sale_items(sale_id) INCLUDE (subtotal);
+
 
 -- ============================================================================
 -- PAGAMENTOS DE VENDAS 
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS sale_payments (
-    id UUID DEFAULT uuid_generate_v4(),
-    tenant_id UUID NOT NULL,
-    
+    id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
     sale_id UUID NOT NULL,
-    sale_created_at TIMESTAMP NOT NULL,
     
     method payment_method_enum NOT NULL,
     amount NUMERIC(10, 2) NOT NULL,
@@ -1686,59 +1655,10 @@ CREATE TABLE IF NOT EXISTS sale_payments (
 
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     created_by UUID,
-
-    -- PK Composta Local
-    PRIMARY KEY (id, sale_created_at),
-
-    -- FK Composta para a Venda
-    FOREIGN KEY (sale_id, sale_created_at) REFERENCES sales(id, created_at) ON DELETE CASCADE,
-    FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
-) PARTITION BY RANGE (sale_created_at);
-
-CREATE INDEX IF NOT EXISTS idx_sale_payments_sale ON sale_payments(sale_id);
-CREATE INDEX IF NOT EXISTS idx_sale_payments_created ON sale_payments(tenant_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_sale_payments_method ON sale_payments(tenant_id, method);
-CREATE INDEX IF NOT EXISTS idx_sale_payments_sale_id ON sale_payments(tenant_id, sale_id);
-
-
-CREATE OR REPLACE FUNCTION check_payment_total()
-RETURNS TRIGGER SET search_path = public, extensions, pg_temp AS $$
-DECLARE
-    v_sale_total NUMERIC;
-    v_total_paid NUMERIC;
-BEGIN
-    -- Busca o total da venda
-    SELECT 
-        total_amount 
-    INTO 
-        v_sale_total 
-    FROM 
-        sales 
-    WHERE 
-        id = NEW.sale_id
-        AND created_at = NEW.sale_created_at;
-    
-    -- Calcula quanto já foi pago (somando o novo pagamento)
-    SELECT 
-        COALESCE(SUM(amount), 0) + NEW.amount 
-    INTO 
-        v_total_paid 
-    FROM 
-        sale_payments 
-    WHERE 
-        sale_id = NEW.sale_id 
-        AND id != NEW.id
-        AND sale_created_at = NEW.sale_created_at;    
-    
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-
-CREATE OR REPLACE TRIGGER trg_check_payment_total
-BEFORE INSERT OR UPDATE ON sale_payments
-FOR EACH ROW EXECUTE FUNCTION check_payment_total();
-
+    CONSTRAINT sale_payments_amount_chk CHECK (amount > 0),
+    FOREIGN KEY (sale_id) REFERENCES sales(id) ON DELETE CASCADE,
+    FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
+);
 
 -- ============================================================================
 -- LOGS - Registro de eventos do sistema
@@ -1757,8 +1677,14 @@ CREATE TABLE IF NOT EXISTS logs (
     CONSTRAINT chk_log_level CHECK (level IN ('DEBUG', 'INFO', 'WARN', 'ERROR', 'FATAL'))
 );
 
-CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
 CREATE INDEX IF NOT EXISTS idx_logs_created_at ON logs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_logs_created_at_1 ON logs (created_at);
+
+-- SELECT cron.schedule(
+--     'delete_old_logs',          -- Nome único do job
+--     '0 6 * * *',                -- Cron: Minuto 0, Hora 6, Qualquer dia/mês (Diário)
+--     $$DELETE FROM logs WHERE created_at < NOW() - INTERVAL '15 days'$$
+-- );
 
 ALTER TABLE logs SET (
     autovacuum_vacuum_scale_factor = 0.1,
@@ -1805,7 +1731,7 @@ CREATE INDEX IF NOT EXISTS idx_currencies_created_at_desc ON currencies(created_
 -- Tabela de auditoria de operações sensíveis
 
 CREATE TABLE IF NOT EXISTS security_audit_log (
-    id BIGINT GENERATED ALWAYS AS IDENTITY,
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     user_id UUID,
     tenant_id UUID,
     operation TEXT NOT NULL,
@@ -1814,40 +1740,11 @@ CREATE TABLE IF NOT EXISTS security_audit_log (
     old_values JSONB,
     new_values JSONB,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (id, created_at),
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE,
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE SET NULL ON UPDATE CASCADE
-) PARTITION BY RANGE (created_at);
+);
 
 CREATE INDEX IF NOT EXISTS idx_audit_record_trace ON security_audit_log (table_name, record_id);
 CREATE INDEX IF NOT EXISTS idx_audit_user ON security_audit_log (user_id);
 CREATE INDEX IF NOT EXISTS idx_audit_created_at_brin ON security_audit_log USING BRIN (created_at);
 
--- ============================================================================
--- TRIGGERS
--- ============================================================================
-
--- products
-CREATE OR REPLACE TRIGGER trg_products_updated_at
-BEFORE UPDATE ON products
-FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-
--- users
-CREATE OR REPLACE TRIGGER trg_users_updated_at
-BEFORE UPDATE ON users
-FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-
--- addresses
-CREATE OR REPLACE TRIGGER trg_addresses_updated_at
-BEFORE UPDATE ON addresses
-FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-
--- categories
-CREATE OR REPLACE TRIGGER trg_categories_updated_at
-BEFORE UPDATE ON categories
-FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-
--- batches
-CREATE OR REPLACE TRIGGER trg_batches_updated_at
-BEFORE UPDATE ON batches
-FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();

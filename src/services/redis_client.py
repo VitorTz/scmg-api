@@ -1,6 +1,7 @@
 from typing import TypeVar, Type, Callable, Awaitable
 from pydantic import BaseModel
 from typing import Optional
+import asyncio
 import redis.asyncio as redis
 import os
 
@@ -8,7 +9,16 @@ import os
 T = TypeVar("T", bound=BaseModel)
 
 
+async def set_cache_background(redis_client: redis.Redis, key: str, value: Type[T], ttl: int):
+    try:
+        payload = value.model_dump_json()
+        await redis_client.set(key, payload, ex=ttl)
+    except Exception as e:
+        print(f"[ERROR] Falha ao salvar cache em background para {key}: {e}")
+            
+            
 class RedisService:
+    
     _client: Optional[redis.Redis] = None
 
     @classmethod
@@ -52,13 +62,12 @@ class RedisService:
         key: str,
         model_class: Type[T],
         fetch_function: Callable[[], Awaitable[T]],
-        ttl_seconds: int = 3600
+        ttl: int = 3600
     ) -> T:
-        redis = cls.get_client()
-
-        # 1. Tenta recuperar do Redis
+        redis_client = cls.get_client()
+                
         try:
-            cached_data = await redis.get(key)
+            cached_data = await redis_client.get(key)
             if cached_data:
                 return model_class.model_validate_json(cached_data)
         except Exception as e:
@@ -66,13 +75,7 @@ class RedisService:
 
         result = await fetch_function()
         
-        try:
-            await redis.set(
-                key, 
-                result.model_dump_json(),
-                ex=ttl_seconds
-            )
-        except Exception as e:
-            print(f"[CACHE WRITE ERROR] {e}")
+        asyncio.create_task(set_cache_background(redis_client, key, result, ttl))
 
         return result
+    

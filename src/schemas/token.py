@@ -18,6 +18,8 @@ class DecodedRefreshToken(BaseModel):
 class DecodedAccessToken(BaseModel):
     
     user_id: UUID
+    tenant_id: UUID
+    max_privilege_level: int
 
 
 class RefreshToken(BaseModel):

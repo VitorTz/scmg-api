@@ -2,7 +2,7 @@ from fastapi import status, Response
 from fastapi.exceptions import HTTPException
 from src.schemas.auth import LoginRequest
 from src.schemas.user import LoginData, UserResponse, UserCreate
-from src.schemas.token import RefreshToken, AccessTokenCreate, RefreshTokenCreate
+from src.schemas.token import RefreshToken, AccessTokenCreate, RefreshTokenCreate, DecodedAccessToken
 from src.schemas.rls import RLSConnection
 from src.model import user as user_model
 from src.model import refresh_token as refresh_token_model
@@ -25,56 +25,57 @@ INVALID_REFRESH_TOKEN = HTTPException(
 )
 
 
+async def revoke_refresh_tokens(refresh_token: Optional[str], conn: Connection):
+    if refresh_token:
+        decoded = security.decode_refresh_token(refresh_token)
+        await refresh_token_model.revoke_token_family_by_token_id(
+            decoded.token_id,
+            conn
+        )
+
+
 async def login(
     login_req: LoginRequest,
     refresh_token: Optional[str],
     response: Response, 
     conn: Connection
 ) -> UserResponse:
-    if refresh_token:
-        try:
-            await refresh_token_model.revoke_token_family_by_token_id(
-                security.decode_refresh_token(refresh_token).token_id,
-                conn
-            )
-        except Exception:
-            pass    
         
     data: Optional[LoginData] = await db_safe_exec(user_model.get_login_data(login_req, conn))
     
     if not data:
         raise INVALID_CREDENTIALS
     
-    if data.roles == ['CLIENTE']:
+    if data.max_privilege_level == 0:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Acesso não permitido para perfil clientes."
+            detail="Acesso não permitido."
         )
         
     if not security.verify_password(login_req.password, data.password_hash):
         raise INVALID_CREDENTIALS
     
-    access_token_create: AccessTokenCreate = security.create_access_token(data.id)
+    access_token_create: AccessTokenCreate = security.create_access_token(
+        data.id,
+        data.tenant_id,
+        data.max_privilege_level
+    )
     
-    refresh_token_create: RefreshTokenCreate = security.create_refresh_token(data.id)
-    await conn.execute("SET LOCAL ROLE app_runtime")
-    await conn.execute(
-        """
-        SELECT set_config('app.current_user_id', $1::text, true),
-                set_config('app.current_user_roles', $2, true),
-                set_config('app.current_user_tenant_id', $3::text, true),
-                set_config('app.current_user_max_privilege', $4::text, true)
-        """,
-        str(data.id),
-        "{" + ",".join(data.roles) + "}",
-        str(data.tenant_id),
-        str(data.max_privilege_level)
-    )
-                
-    await db_safe_exec(
-        user_model.update_user_last_login(data.id, conn),
-        refresh_token_model.create_refresh_token(refresh_token_create, conn)
-    )
+    refresh_token_create: RefreshTokenCreate = security.create_refresh_token(data.id)    
+        
+    async with conn.transaction():
+        await conn.execute(
+            """
+            SELECT  set_config('app.current_user_id', $1::text, true),
+                    set_config('app.current_user_tenant_id', $2::text, true)
+            """, 
+            str(data.id),
+            str(data.tenant_id)
+        )
+        await revoke_refresh_tokens(refresh_token, conn)
+        await user_model.update_user_last_login(data.id, conn)
+        await refresh_token_model.create_refresh_token(refresh_token_create, conn)
+    
         
     security.set_session_token_cookie(
         response, 
@@ -130,7 +131,11 @@ async def refresh(
                 await refresh_token_model.revoke_token_family(old_token.family_id, temp_conn)
         raise INVALID_REFRESH_TOKEN
     
-    access_token_create: AccessTokenCreate = security.create_access_token(user.id)
+    access_token_create: AccessTokenCreate = security.create_access_token(
+        user.id,
+        user.tenant_id,
+        user.max_privilege_level
+    )
     
     refresh_token_create: RefreshTokenCreate = security.create_refresh_token(user.id, old_token.family_id)
     
@@ -158,10 +163,10 @@ async def signup(user: UserCreate, rls: RLSConnection) -> UserResponse:
     ))
 
 
-async def logout(refresh_token: str, response: Response, conn: Connection) -> None:
+async def logout(data: DecodedAccessToken, response: Response, conn: Connection) -> None:
     security.unset_session_token_cookie(response)
-    await refresh_token_model.revoke_token_family_by_token_id(
-        security.decode_refresh_token(refresh_token).token_id,
+    await refresh_token_model.revoke_token_by_user_id(
+        data.user_id,
         conn
     )
         

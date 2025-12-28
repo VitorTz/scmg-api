@@ -62,11 +62,17 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
         return False
     
 
-def create_access_token(user_id: uuid.UUID | str) -> AccessTokenCreate:
+def create_access_token(
+    user_id: uuid.UUID | str, 
+    tenant_id: uuid.UUID | str,
+    max_privilege_level: int
+) -> AccessTokenCreate:
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=Constants.ACCESS_TOKEN_EXPIRE_MINUTES)
     
     payload = {
         "sub": str(user_id),
+        "sub1": str(tenant_id),
+        "sub2": max_privilege_level,
         "type": "access",
         "exp": expires_at
     }
@@ -127,15 +133,24 @@ def decode_access_token(access_token: str) -> DecodedAccessToken:
         if jwt_payload.get("type") != "access":
             raise CREDENTIALS_EXCEPTION
 
-        user_id = jwt_payload.get("sub")        
+        user_id = jwt_payload.get("sub")
+        tenant_id = jwt_payload.get("sub1")
+        max_privilege_level = jwt_payload.get("sub2")
+                
+        if not user_id or not tenant_id or not max_privilege_level:
+            raise CREDENTIALS_EXCEPTION
         
-        return DecodedAccessToken(user_id=user_id)
+        return DecodedAccessToken(
+            user_id=user_id,
+            tenant_id=tenant_id,
+            max_privilege_level=max_privilege_level
+        )
         
     except Exception:
         raise CREDENTIALS_EXCEPTION
 
 
-def decode_refresh_token(refresh_token: Optional[str]) -> DecodedRefreshToken:    
+def decode_refresh_token(refresh_token: Optional[str]) -> DecodedRefreshToken:
     if not refresh_token: 
         raise CREDENTIALS_EXCEPTION
     
@@ -144,11 +159,10 @@ def decode_refresh_token(refresh_token: Optional[str]) -> DecodedRefreshToken:
             refresh_token,
             Constants.SECRET_KEY,
             algorithms=[Constants.ALGORITHM]
-        )
-        
+        )        
         token_id = jwt_payload.get("sub")
         
-        if jwt_payload.get("type") != "refresh" or not token_id:
+        if not token_id or jwt_payload.get("type") != "refresh":
             raise CREDENTIALS_EXCEPTION        
         
         return DecodedRefreshToken(token_id=token_id)
@@ -171,30 +185,25 @@ async def get_rls_connection(
     pool: Pool = Depends(get_db_pool),
     access_token: Optional[str] = Cookie(default=None)
 ):
-    user_data: DecodedAccessToken = decode_access_token(access_token)    
+    data: DecodedAccessToken = decode_access_token(access_token)
     async with pool.acquire() as connection:
         async with connection.transaction():
             try:
-                row = await user_model.get_user_rls_data(user_data.user_id, connection)
-                if not row: raise CREDENTIALS_EXCEPTION
-                await connection.execute("SET LOCAL ROLE app_runtime")
                 await connection.execute(
                     """
                     SELECT set_config('app.current_user_id', $1::text, true),
-                           set_config('app.current_user_roles', $2, true),
-                           set_config('app.current_user_tenant_id', $3::text, true),
-                           set_config('app.current_user_max_privilege', $4::text, true)
+                           set_config('app.current_user_tenant_id', $2::text, true),
+                           set_config('app.current_user_max_privilege', $3::text, true)
                     """,
-                    str(row['id']),
-                    "{" + ",".join(row['roles']) + "}",
-                    str(row['tenant_id']),
-                    str(row['max_privilege_level'])
+                    str(data.user_id),
+                    str(data.tenant_id),
+                    str(data.max_privilege_level)
                 )
             except Exception as e:
                 print(f"[CRITICAL] Erro ao configurar sessão RLS: {e}")
                 raise DatabaseError(code=500, detail="Security context failure.")
             
-            yield RLSConnection(row, connection)
+            yield RLSConnection(data, connection)
 
 
 async def get_postgres_connection(pool: Pool = Depends(get_db_pool)):

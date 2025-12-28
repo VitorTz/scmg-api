@@ -24,7 +24,7 @@ class Database:
         
         try:
             self.pool = await asyncpg.create_pool(
-                dsn=os.getenv("DATABASE_URL"),
+                dsn=os.getenv("DATABASE_URL_APP_RUNTIME"),
                 min_size=2,
                 max_size=20,
                 command_timeout=60,

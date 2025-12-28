@@ -7,20 +7,28 @@ from typing import Optional
 from src.model import ncm as ncm_model
 
 
-async def search_ncm(q: str, uf: str, limit: int, offset: int, conn: Connection):
-    q_key = q.replace(" ", "_").lower() if q else "all"
-    key = f"ncm:{uf.upper()}:{limit}:{offset}:{q_key}"
+async def search_ncm(
+    q: str,
+    limit: int, 
+    offset: int, 
+    conn: Connection
+):
+    q_normalized = " ".join(q.strip().lower().split()) if q else "all"
+    q_key = q_normalized.replace(" ", "_")
+    
+    key = f"ncm::{limit}:{offset}:{q_key}"
+    
     return await RedisService.get_or_set_cache(
         key, 
         Pagination[NcmResponse], 
-        lambda : ncm_model.search_ncms(q, uf, limit, offset, conn)
+        lambda: ncm_model.search_ncms(q, limit, offset, conn)        
     )
     
 
-async def get_ncm_by_code(code: str, uf: str, conn: Connection) -> NcmResponse:
-    ncm: Optional[NcmResponse] = await ncm_model.get_ncm_by_code(code, uf, conn)
+async def get_ncm_by_code(code: str, conn: Connection) -> NcmResponse:
+    ncm: Optional[NcmResponse] = await ncm_model.get_ncm_by_code(code, conn)
 
     if not ncm:
-        raise HTTPException(status_code=404, detail=f"NCM {code} não encontrado para UF {uf}")
+        raise HTTPException(status_code=404, detail=f"NCM {code} não encontrado")
 
     return ncm
