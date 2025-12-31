@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, status, Response, Cookie
 from fastapi_limiter.depends import RateLimiter
 from src.security import get_postgres_connection, get_rls_connection
+from src.schemas.tenant import TenantPublicInfo
 from src.schemas.auth import LoginRequest
 from src.schemas.user import UserResponse
 from src.schemas.rls import RLSConnection
@@ -20,6 +21,11 @@ router = APIRouter(dependencies=[Depends(RateLimiter(times=16, seconds=60))])
 )
 async def get_me(rls: RLSConnection = Depends(get_rls_connection)):
     return await user_model.get_user_by_id(rls.user.user_id, rls.conn)
+
+
+@router.get("/resolve-store/{slug}", response_model=TenantPublicInfo)
+async def resolve_store_by_slug(slug: str, conn: Connection = Depends(get_postgres_connection)):
+    return await auth_service.resolve_tenant_slug(slug, conn)
 
 
 @router.post(

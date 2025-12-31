@@ -27,6 +27,16 @@ EXCEPTION
 END;
 $$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
 
+-- Retorna o slug da sessão atual
+CREATE OR REPLACE FUNCTION current_user_tenant_slug()
+RETURNS TEXT SET search_path = public, pg_temp AS $$
+BEGIN
+    RETURN NULLIF(current_setting('app.current_user_tenant_slug', TRUE), '')::TEXT;
+EXCEPTION
+    WHEN OTHERS THEN RETURN NULL;
+END;
+$$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
+
 
 -- Retorna as roles do usuário atual
 CREATE OR REPLACE FUNCTION current_user_roles()
@@ -113,7 +123,14 @@ ALTER TABLE tenants ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenants_select_policy ON tenants;
 CREATE POLICY tenants_select_policy ON tenants
     FOR SELECT
-    USING (id = current_user_tenant_id());
+    USING (
+        (
+            id = current_user_tenant_id() 
+            OR 
+            slug = current_user_tenant_slug()
+        )
+        AND is_active = TRUE
+    );
 
 
 -- ============================================================================

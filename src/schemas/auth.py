@@ -2,11 +2,17 @@ from pydantic import BaseModel, Field, field_validator
 
 
 class LoginRequest(BaseModel):
+    
+    tenant_id: str = Field(
+        ..., 
+        description="UUID do tenant"
+    )
         
     identifier: str = Field(
         ..., 
         description="Email ou CPF do usuário"
     )
+    
     password: str = Field(
         ...,
         description="Senha em texto plano"

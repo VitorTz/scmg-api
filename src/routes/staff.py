@@ -12,14 +12,16 @@ from src.services import staff as staff_service
 router = APIRouter(dependencies=[Depends(RateLimiter(times=32, seconds=60))])
 
 
-
 @router.post(
     "/users",
     status_code=status.HTTP_201_CREATED,
     response_model=UserResponse    
 )
-async def register_user(user: UserCreate, rls: RLSConnection = Depends(get_rls_connection)):
-    return await auth_service.signup(user, rls.user.tenant_id, rls)
+async def register_user(
+    payload: UserCreate, 
+    rls: RLSConnection = Depends(get_rls_connection)
+):
+    return await auth_service.signup(payload, rls)
 
 
 @router.patch("/users", response_model=UserResponse)

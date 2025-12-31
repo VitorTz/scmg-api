@@ -7,7 +7,6 @@
 -- EXTENSIONS
 -- ============================================================================
 
-
 CREATE EXTENSION IF NOT EXISTS pg_cron;
 CREATE EXTENSION IF NOT EXISTS "unaccent";
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
@@ -562,13 +561,81 @@ CREATE TABLE IF NOT EXISTS cnpjs (
 CREATE TABLE IF NOT EXISTS tenants (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     name CITEXT NOT NULL,
-    cnpj VARCHAR(14),
+    slug TEXT,
+    cnpj TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     is_active BOOLEAN DEFAULT TRUE,
     notes TEXT,
-    CONSTRAINT tenants_unique_cnpj UNIQUE (cnpj)
+    CONSTRAINT tenants_unique_cnpj UNIQUE (cnpj),
+    CONSTRAINT tenants_unique_slug UNIQUE (slug)
 );
 
+
+CREATE OR REPLACE FUNCTION public_resolve_tenant_by_slug(p_slug TEXT)
+RETURNS TABLE (
+    id UUID,
+    name CITEXT,
+    created_at TIMESTAMP,
+    slug TEXT
+)
+SECURITY DEFINER 
+SET search_path = public, pg_temp
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 
+        t.id, 
+        t.name, 
+        t.created_at,
+        t.slug
+    FROM 
+        tenants t
+    WHERE 
+        t.slug = p_slug
+        AND t.is_active = TRUE;
+END;
+$$;
+
+
+CREATE OR REPLACE FUNCTION generate_unique_tenant_code()
+RETURNS TRIGGER AS $$
+DECLARE
+    new_code TEXT;
+    code_exists BOOLEAN;
+BEGIN
+    
+    IF NEW.slug IS NOT NULL THEN
+        RETURN NEW;
+    END IF;
+
+    LOOP
+        new_code := (floor(random() * 90000 + 10000))::TEXT;
+        
+        SELECT EXISTS (
+            SELECT 
+                1
+            FROM 
+                tenants
+            WHERE 
+                slug = new_code
+        ) INTO code_exists;
+
+        EXIT WHEN NOT code_exists;
+
+    END LOOP;
+    
+    NEW.slug := new_code;
+    
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+
+CREATE OR REPLACE TRIGGER trg_generate_tenant_code
+BEFORE INSERT ON tenants
+FOR EACH ROW
+EXECUTE FUNCTION generate_unique_tenant_code();
 
 -- ============================================================================
 -- ROLE CONFIG
@@ -717,18 +784,22 @@ FOR EACH ROW
 EXECUTE FUNCTION trg_calculate_max_privilege();
 
 
-CREATE OR REPLACE FUNCTION get_user_login_data(p_identifier TEXT)
+CREATE OR REPLACE FUNCTION get_user_login_data(
+    p_identifier TEXT,
+    p_tenant_id UUID
+)
 RETURNS TABLE (
     id UUID,
     name TEXT,
     nickname TEXT,
     email TEXT,
     password_hash TEXT,
+    quick_access_pin_hash TEXT,
     notes TEXT,
     state_tax_indicator INTEGER,
-    created_at TIMESTAMPTZ,
+    created_at TIMESTAMP,
     created_by UUID,
-    updated_at TIMESTAMPTZ,
+    updated_at TIMESTAMP,
     tenant_id UUID,
     roles user_role_enum[],
     max_privilege_level INTEGER
@@ -748,24 +819,27 @@ BEGIN
         u.nickname,
         u.email::TEXT,
         u.password_hash,
+        u.quick_access_pin_hash,
         u.notes,
         u.state_tax_indicator,
-        u.created_at::TIMESTAMPTZ,
+        u.created_at,
         u.created_by,
-        u.updated_at::TIMESTAMPTZ,
+        u.updated_at,
         u.tenant_id,
         u.roles,
         u.max_privilege_level
     FROM 
         users u
     WHERE
-        CASE 
-            WHEN v_is_email THEN
-                u.email = v_clean_input
-            ELSE
-                u.cpf = regexp_replace(v_clean_input, '\D','','g')
-        END
-    LIMIT 1;
+        u.tenant_id = p_tenant_id
+        AND (
+            CASE 
+                WHEN v_is_email THEN
+                    u.email = v_clean_input
+                ELSE
+                    u.cpf = regexp_replace(v_clean_input, '\D','','g')
+            END
+        );    
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 

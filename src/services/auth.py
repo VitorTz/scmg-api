@@ -1,17 +1,18 @@
 from fastapi import status, Response
 from fastapi.exceptions import HTTPException
 from src.schemas.auth import LoginRequest
-from src.schemas.user import LoginData, UserResponse, UserCreate
+from src.schemas.tenant import TenantPublicInfo
 from src.schemas.token import RefreshToken, AccessTokenCreate, RefreshTokenCreate, DecodedAccessToken
+from src.schemas.user import LoginData, UserResponse, UserCreate, UserManagementContext
 from src.schemas.rls import RLSConnection
 from src.model import user as user_model
 from src.model import refresh_token as refresh_token_model
 from src.db.db import db_safe_exec, db
+from src.constants import Constants
 from datetime import datetime, timezone
 from typing import Optional
 from asyncpg import Connection
 from src import security
-from uuid import UUID
 
 
 INVALID_CREDENTIALS = HTTPException(
@@ -26,6 +27,18 @@ INVALID_REFRESH_TOKEN = HTTPException(
 )
 
 
+async def resolve_tenant_slug(slug: str, conn: Connection):
+    row = await conn.fetchrow(
+        "SELECT * FROM public_resolve_tenant_by_slug($1)",
+        slug
+    )
+    
+    if not row:
+        raise HTTPException(404, "Loja não encontrada. Verifique o código.")
+        
+    return TenantPublicInfo(**row)
+
+
 async def revoke_refresh_tokens(refresh_token: Optional[str], conn: Connection):
     if refresh_token:
         decoded = security.decode_refresh_token(refresh_token)
@@ -34,7 +47,76 @@ async def revoke_refresh_tokens(refresh_token: Optional[str], conn: Connection):
             conn
         )
 
+async def process_login_transaction(
+    user_data: LoginData,
+    refresh_token_create: RefreshTokenCreate,
+    old_refresh_token_str: Optional[str],
+    conn: Connection
+):
+    old_token_id = None
+    if old_refresh_token_str:
+        try:
+            decoded = security.decode_refresh_token(old_refresh_token_str)
+            old_token_id = decoded.token_id
+        except Exception:
+            pass
+        
+    await conn.execute(
+        """
+        -- [Passo 1] Configura Sessão (Para RLS funcionar nos passos seguintes)
+        SELECT set_config('app.current_user_id', $1::text, true);
+        SELECT set_config('app.current_user_tenant_id', $2::text, true);
 
+        -- [Passo 2] Revoga Família de Tokens Antiga        
+        UPDATE 
+            refresh_tokens
+        SET 
+            revoked = TRUE
+        WHERE 
+            $3::uuid IS NOT NULL
+            AND family_id = (
+                SELECT 
+                    family_id 
+                FROM 
+                    refresh_tokens 
+                WHERE 
+                    id = $3::uuid
+            )
+            AND revoked = FALSE;
+
+        -- [Passo 3] Atualiza Último Login
+        UPDATE 
+            users 
+        SET 
+            last_login_at = CURRENT_TIMESTAMP 
+        WHERE 
+            id = $1::uuid;
+
+        -- [Passo 4] Insere Novo Token
+        INSERT INTO refresh_tokens (
+            id,
+            user_id,
+            expires_at,
+            revoked,
+            family_id
+        ) VALUES (
+            $4::uuid, -- id do novo token
+            $1::uuid, -- user_id
+            $5,       -- expires_at
+            $6,       -- revoked
+            $7::uuid  -- family_id
+        );
+        """,
+        user_data.id,
+        user_data.tenant_id,
+        old_token_id,
+        refresh_token_create.token_id,
+        refresh_token_create.expires_at,
+        refresh_token_create.revoked,
+        refresh_token_create.family_id
+    )
+    
+    
 async def login(
     login_req: LoginRequest,
     refresh_token: Optional[str],
@@ -44,8 +126,7 @@ async def login(
         
     data: Optional[LoginData] = await db_safe_exec(user_model.get_login_data(login_req, conn))
     
-    if not data:
-        raise INVALID_CREDENTIALS
+    if not data: raise INVALID_CREDENTIALS
     
     if data.max_privilege_level == 0:
         raise HTTPException(
@@ -61,22 +142,10 @@ async def login(
         data.tenant_id
     )
     
-    refresh_token_create: RefreshTokenCreate = security.create_refresh_token(data.id)    
-        
-    async with conn.transaction():
-        await conn.execute(
-            """
-            SELECT  set_config('app.current_user_id', $1::text, true),
-                    set_config('app.current_user_tenant_id', $2::text, true)
-            """, 
-            str(data.id),
-            str(data.tenant_id)
-        )
-        await revoke_refresh_tokens(refresh_token, conn)
-        await user_model.update_user_last_login(data.id, conn)
-        await refresh_token_model.create_refresh_token(refresh_token_create, conn)
+    refresh_token_create: RefreshTokenCreate = security.create_refresh_token(data.id)                
     
-        
+    await process_login_transaction(data, refresh_token_create, refresh_token, conn)
+    
     security.set_session_token_cookie(
         response, 
         access_token_create.jwt_token,
@@ -154,60 +223,36 @@ async def refresh(
     return user
 
 
-async def signup(user: UserCreate, tenant_id: str | UUID, rls: RLSConnection) -> UserResponse:
-    # 1. VALIDAÇÃO DE TENANT (Segurança Básica)
-    # Garante que o usuário logado só crie contas para sua própria empresa
-    if str(rls.user.tenant_id) != str(tenant_id):
-         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, 
-            detail="Você não pode criar usuários em outra organização."
-         )
-
-    # 2. CALCULAR PERMISSÕES    
-    actor_level, is_staff_authorized, new_target_level = await user_model.get_user_management_context(
-        user_id=rls.user.user_id, 
-        required_roles=["ADMIN", "GERENTE", "FISCAL_CAIXA"],
-        new_user_roles=user.roles,
+async def signup(user: UserCreate, rls: RLSConnection) -> UserResponse:
+    ctx: UserManagementContext = await user_model.get_user_management_context(
+        actor_id=rls.user.user_id,
+        proposed_roles=user.roles,
         conn=rls.conn
     )
     
-    # 3. LÓGICA DE BLOQUEIO
-    
-    # Regra A: Escalada de Privilégio Vertical
-    # Ninguém pode criar alguém mais poderoso que si mesmo.
-    if new_target_level > actor_level:
+    if not ctx:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado.")
+        
+    if not ctx.actor_has_management_role:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, 
-            detail=f"Seu nível ({actor_level}) é inferior ao nível do usuário que tenta criar ({new_target_level})."
+            status_code=403, 
+            detail=f"Apenas {', '.join(Constants.MANAGEMENT_ROLES)} podem criar novos usuários."
+        )
+    
+    if ctx.actor_privilege_level < ctx.proposed_roles_max_level:
+        raise HTTPException(
+            status_code=403, 
+            detail=f"Você (Nível {ctx.actor_privilege_level}) não pode criar um usuário com nível superior ({ctx.proposed_roles_max_level})."
         )
         
-    # Regra B: Permissão para criar Funcionários
-    # Se o novo usuário tem algum poder (nível > 0), quem cria precisa ser Staff Autorizado.
-    if new_target_level > 0 and not is_staff_authorized:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Você não tem permissão para criar funcionários com acesso administrativo."
-        )
-
-    # Regra C: Cliente criando Cliente (Opcional, mas recomendado travar)
-    # Se quem está criando não é Staff (ex: é um Cliente) e tenta criar outro Cliente.
-    if not is_staff_authorized and new_target_level == 0:
-        # Aqui depende da regra de negócio. Geralmente cliente não cria usuário.
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Clientes não têm permissão para cadastrar novos usuários manualmente."
-        )
-
-    # 4. HASHING
     password_hash = security.hash_password(user.password) if user.password else None
     quick_access_pin_hash = security.hash_password(user.quick_access_pin_hash) if user.quick_access_pin_hash else None
-
-    # 5. CRIAÇÃO
+    
     return await db_safe_exec(user_model.create_user(
         user, 
         password_hash, 
         quick_access_pin_hash, 
-        tenant_id, 
+        rls.user.tenant_id,
         rls.conn
     ))
 

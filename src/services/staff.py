@@ -1,6 +1,5 @@
-from src.schemas.user import UserCompleteResponse, UserUpdate
+from src.schemas.user import UserCompleteResponse, UserUpdate, UserManagementContext
 from typing import Optional
-from asyncpg import Connection
 from src.services import staff as staff_service
 from fastapi.exceptions import HTTPException
 from src.schemas.rls import RLSConnection
@@ -30,24 +29,25 @@ async def update_user(
     payload: UserUpdate,
     rls: RLSConnection
 ) -> Optional[UserCompleteResponse]:
-    ctx = await user_model.get_user_management_context(rls.user.user_id, payload.roles, rls.conn, payload.id)
+    ctx: UserManagementContext = await user_model.get_user_management_context(
+        rls.user.user_id, 
+        payload.roles, 
+        rls.conn, 
+        payload.id
+    )
     
-    if not ctx:
+    if not ctx or rls.user.tenant_id != ctx.other_user_tenant_id:
         raise HTTPException(status_code=404, detail="Usuário não encontrado.")
     
     # Verifica se pode atribuar as funções
-    if ctx.max_privilege_level == 0 or not ctx.has_management_permission or ctx.max_privilege_level < ctx.new_roles_max_privilege:
-        raise HTTPException(status_code=403, detail="Permissão insuficiente para editar este usuário.")    
-    
-    # Verifica se é do mesmo tenant    
-    if rls.user.tenant_id != ctx.other_user_tenant_id:
-        raise HTTPException(status_code=404, detail="Usuário não encontrado.")
+    if not ctx.has_any_required_role or ctx.max_privilege_level < ctx.new_roles_max_privilege:
+        raise HTTPException(status_code=403, detail="Permissão insuficiente para editar este usuário.")
     
     is_self = rls.user.user_id == payload.id
     update_data = payload.model_dump(exclude_unset=True)
 
     # 2. Lógica de Permissão de Campos
-    if is_self and not ctx.has_management_permission:
+    if is_self and not ctx.has_any_required_role:
         # Se está tentando mudar seu próprio usuário mas não tem permissão de gerenciamento de usuário
         allowed_data = {k: v for k, v in update_data.items() if k in SELF_EDITABLE_FIELDS}
         update_data = allowed_data

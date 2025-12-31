@@ -198,9 +198,10 @@ class UserResponse(UserBase):
     model_config = ConfigDict(from_attributes=True)
     
     
-class LoginData(UserResponse):
+class LoginData(UserResponse):    
     
-    password_hash: str
+    password_hash: Optional[str]
+    quick_access_pin_hash: Optional[str]
     
 
 class UserCompleteResponse(BaseModel):
@@ -248,12 +249,15 @@ class UserCompleteResponse(BaseModel):
     
     
 class UserManagementContext(BaseModel):
-    
     model_config = ConfigDict(from_attributes=True)
     
-    max_privilege_level: int
-    has_management_permission: bool
-    new_roles_max_privilege: int
-    other_user_tenant_id: Optional[UUID] = None
-    target_current_privilege_level: Optional[int] = 0
+    # --- Contexto do ATOR (Quem está logado) ---
+    actor_privilege_level: int
+    actor_has_management_role: bool
     
+    # --- Contexto da MUDANÇA (O que está sendo enviado) ---
+    proposed_roles_max_level: int
+    
+    # --- Contexto do ALVO (Quem está sendo editado - Opcional se for criação) ---
+    target_tenant_id: Optional[UUID] = None
+    target_privilege_level: Optional[int] = None

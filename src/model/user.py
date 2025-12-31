@@ -9,65 +9,47 @@ from uuid import UUID
 
 async def get_login_data(login: LoginRequest, conn: Connection) -> Optional[LoginData]:
     row = await conn.fetchrow("SELECT * FROM get_user_login_data($1)", login.identifier)
-    return LoginData(**dict(row)) if row else None
-
-
-async def update_user_last_login(user_id: str | UUID, conn: Connection) -> None:
-    print("oi")
-    try:
-        await conn.execute(
-            """
-                UPDATE 
-                    users
-                SET 
-                    last_login_at = CURRENT_TIMESTAMP
-                WHERE 
-                    id = $1
-            """,
-            user_id
-        )
-    except Exception as e:
-        print(e)
-        raise e
-    print("oi1")
-
-
-async def get_user_roles(id: str | UUID, conn: Connection) -> list[str]:
-    row = await conn.fetchrow("SELECT roles FROM users WHERE id = $1", id)
-    return row['roles'] if row else []
-
-
+    return LoginData(**row) if row else None
+    
+    
 async def get_user_management_context(
-    user_id: str | UUID,            # Ator (Quem executa a ação)
-    desired_roles: list[str],       # Roles alvo
+    actor_id: str | UUID,
+    proposed_roles: list[str],
     conn: Connection,
-    new_user_id: Optional[str | UUID] = None # Alvo (Quem sofre a ação) - None se for criação
+    target_user_id: Optional[str | UUID] = None,
+    required_management_roles: list[str] = Constants.MANAGEMENT_ROLES 
 ) -> Optional[UserManagementContext]:
     """
-        Está função deve ser usada quando um usuário é criado ou atualizado.
-        Ajuda a definir o que o usuário que está executando a ação pode ou não fazer.
+    Retorna o contexto de autorização comparando o Ator (Actor) e o Alvo (Target).
     """
+    
+    safe_proposed_roles = proposed_roles if proposed_roles else []
+
     row = await conn.fetchrow(
         """
         SELECT
-            u.max_privilege_level,
-            (u.roles && $2::user_role_enum[]) as has_management_permission,
-            get_max_privilege_from_roles($3::user_role_enum[]) as new_roles_max_privilege,
-            (
-                SELECT tenant_id 
-                FROM users target 
-                WHERE target.id = $4
-            ) as other_user_tenant_id
+            -- 1. Dados do ATOR (Quem clica no botão)
+            actor.max_privilege_level                   AS actor_privilege_level,
+            (actor.roles && $2::user_role_enum[])       AS actor_has_management_role,
+            
+            -- 2. Dados da PROPOSTA (O nível das novas roles enviadas)
+            get_max_privilege_from_roles($3::user_role_enum[]) AS proposed_roles_max_level,
+            
+            -- 3. Dados do ALVO (Quem sofre a edição) - Via LEFT JOIN
+            target.tenant_id                            AS target_tenant_id,
+            target.max_privilege_level                  AS target_privilege_level
             
         FROM
-            users u
+            users actor
+        LEFT JOIN
+            users target ON target.id = $4
         WHERE 
-            u.id = $1
+            actor.id = $1
         """,
-        user_id,                    # $1
-        Constants.MANAGEMENT_ROLES, # $2
-        desired_roles,              # $3
-        new_user_id                 # $4 (Pode ser None)
+        actor_id,
+        required_management_roles,
+        safe_proposed_roles,
+        target_user_id
     )
 
     return UserManagementContext(**row) if row else None

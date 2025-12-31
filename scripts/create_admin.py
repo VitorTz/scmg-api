@@ -48,6 +48,10 @@ def create_superuser():
         phone = remove_non_numbers(input("Telefone (apenas números): "))
         cpf = remove_non_numbers(input("CPF (apenas números): "))
         raw_password = getpass("Senha: ").strip()
+        raw_password1 = getpass("Confirme a senha: ").strip()
+        if raw_password != raw_password1:
+            print("\n[ERRO] Senhas não são iguais.")
+            return
         tenant_id_str = input("Tenant UUID: ").strip()
 
         # Validação básica pré-banco
