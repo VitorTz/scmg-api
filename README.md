@@ -15,7 +15,7 @@ O diferencial deste projeto reside na sua arquitetura de banco de dados avançad
 
 ### Principais Funcionalidades
 
-- **Multi-Tenancy Real**: Isolamento de dados via RLS forçado no banco de dados. A aplicação configura o contexto da sessão (app.current_user_tenant_id) e o PostgreSQL garante a blindagem.
+- **Multi-Tenancy Real**: Isolamento de dados forçado no banco de dados. A aplicação configura o contexto da sessão (app.current_user_tenant_id) e o PostgreSQL garante a blindagem.
 
 - **Alta Performance & Escalabilidade**:
     - Uso de Table Partitioning (via pg_partman) para tabelas volumosas (sales, sale_items, sale_payments), garantindo consultas rápidas mesmo com milhões de registros.
