@@ -1,6 +1,6 @@
 # Virtus API (Sistema de Controle de Mercados, Lojas e Bares/Restaurantes)
 
-Virtus é uma API RESTful robusta, segura e Multi-Tenant desenvolvida para orquestrar o ecossistema SCMG. Esta aplicação serve como o backend centralizado para duas interfaces clientes:
+Virtus é uma API RESTful robusta, segura e Multi-Tenant. Esta aplicação serve como o backend centralizado para duas interfaces clientes:
 
 
 1. Desktop Client (JavaFX): PDV completo com emissão fiscal (NFCe/NFe)
@@ -8,10 +8,10 @@ Virtus é uma API RESTful robusta, segura e Multi-Tenant desenvolvida para orque
 2. Web Client (React/Next.js): Painel administrativo para gestão de estoque, financeiro e relatórios (sem emissão fiscal).
 
 
-## Visão Geral da Arquitetura
+# Arquitetura do Banco de Dados
 
-O diferencial deste projeto reside na sua arquitetura de banco de dados avançada e foco em segurança. O sistema utiliza Row Level Security (RLS) nativo do PostgreSQL para garantir isolamento absoluto de dados entre inquilinos (Tenants), permitindo uma única instância de banco de dados para múltiplos clientes sem vazamento de informações.
-
+- O schema foi projetado com foco em integridade e conformidade fiscal brasileira.
+- Utiliza Row Level Security (RLS). Cada tabela possui uma coluna tenant_id, e as políticas de segurança do PostgreSQL garantem que um usuário de uma loja nunca acesse os dados de outra, mesmo compartilhando a mesma base de dados.
 
 ### Principais Funcionalidades
 
